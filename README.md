@@ -136,6 +136,12 @@ audit/
 
 ---
 
+## Disclaimer
+
+This script is a diagnostic aid, not a guarantee of security. Always independently verify command outputs and findings using your own judgment and additional tools. No automated script can account for every environment, configuration, or threat — use this as a starting point for investigation, not a final verdict on whether your server is safe.
+
+---
+
 ## Notes
 
 - The script does not make any changes to your system on its own. Every remediation step requires you to run the suggested command manually.

@@ -125,6 +125,10 @@ draw_menu() {
     _line "  ║       Ubuntu Server Security Audit       ║"
     _line "  ╚══════════════════════════════════════════╝"
     _line "${RESET}"
+    _line "  ${AMBER}${BOLD}⚠  Disclaimer${RESET}"
+    _line "  ${AMBER}Always independently verify command outputs.${RESET}"
+    _line "  ${AMBER}Do not rely solely on this script to assess server security.${RESET}"
+    _line ""
     _line "  $(_hrule ┌ ─ ┐)"
 
     local i

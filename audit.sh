@@ -12,18 +12,21 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-divider()  { echo -e "${CYAN}────────────────────────────────────────────────────${RESET}"; }
-header()   { clear; echo -e "\n${BOLD}${CYAN}$1${RESET}"; divider; }
-desc()     { echo -e "${AMBER}▸ $1${RESET}"; }
-run()      { echo -e "${GREEN}\$ $1${RESET}"; eval "$1"; echo; }
-pause()    { echo -e "\n${DIM}Press Enter to return to menu...${RESET}"; read -r; }
-
-# Analysis helpers
+divider()         { echo -e "${CYAN}────────────────────────────────────────────────────${RESET}"; }
+header()          { clear; echo -e "\n${BOLD}${CYAN}$1${RESET}"; divider; }
+desc()            { echo -e "${AMBER}▸ $1${RESET}"; }
+run()             { echo -e "${GREEN}\$ $1${RESET}"; eval "$1"; echo; }
+pause()           { echo -e "\n${DIM}Press Enter to return to menu...${RESET}"; read -r; }
 analysis_header() { echo -e "\n${BOLD}${CYAN}── Analysis ────────────────────────────────────────${RESET}"; }
-flag()   { echo -e "  ${RED}${BOLD}[!]${RESET} $1"; }
-warn()   { echo -e "  ${AMBER}${BOLD}[~]${RESET} $1"; }
-ok()     { echo -e "  ${GREEN}${BOLD}[✓]${RESET} $1"; }
-info()   { echo -e "  ${CYAN}[-]${RESET} $1"; }
+flag()            { echo -e "  ${RED}${BOLD}[!]${RESET} $1";   RISK_FLAGS=$(( RISK_FLAGS + 1 )); }
+warn()            { echo -e "  ${AMBER}${BOLD}[~]${RESET} $1"; RISK_WARNS=$(( RISK_WARNS + 1 )); }
+ok()              { echo -e "  ${GREEN}${BOLD}[✓]${RESET} $1"; }
+info()            { echo -e "  ${CYAN}[-]${RESET} $1"; }
+fix()             { echo -e "    ${DIM}↳ fix: $1${RESET}"; }  # actionable remediation hint
+
+# Global risk counters (accumulated across run_all)
+RISK_FLAGS=0
+RISK_WARNS=0
 
 # ─── Menu items ──────────────────────────────
 
@@ -75,7 +78,7 @@ for _i in "${!MENU_ITEMS[@]}"; do
 done
 MAX_NUM=$(( _num - 1 ))
 
-is_separator() { [[ "${MENU_ITEMS[$1]}" == ──* ]]; }
+is_separator()    { [[ "${MENU_ITEMS[$1]}" == ──* ]]; }
 
 next_selectable() {
     local i=$(( SELECTED + 1 ))
@@ -182,422 +185,705 @@ draw_menu() {
 check_active_sessions() {
     header "Active Sessions"
     desc "Shows who is currently logged in, from which IP, and what they are running."
-    desc "Any unfamiliar users or source IPs are a red flag."
     local output
     output=$(w)
     echo "$output"
     echo
 
     analysis_header
+    # Parse session lines (skip header rows)
+    local sessions
+    sessions=$(echo "$output" | tail -n +3 | grep -v '^$' || true)
     local session_count
-    session_count=$(echo "$output" | tail -n +3 | grep -c '.' || true)
-    local unique_ips
-    unique_ips=$(echo "$output" | tail -n +3 | awk '{print $3}' | sort -u | grep -v '^$' || true)
-    local root_sessions
-    root_sessions=$(echo "$output" | grep '^root' || true)
+    session_count=$(echo "$sessions" | grep -c '.' 2>/dev/null || echo 0)
 
-    [ "$session_count" -le 2 ] && ok "Normal number of active sessions ($session_count)." \
-        || warn "$session_count active sessions — verify all are expected."
-    [ -z "$root_sessions" ] && ok "No root sessions detected." \
-        || flag "Root is logged in directly: $root_sessions"
-    if [ -n "$unique_ips" ]; then
-        while IFS= read -r ip; do
-            [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-                && info "Session from IP: ${BOLD}$ip${RESET} — verify this is you." \
-                || true
-        done <<< "$unique_ips"
+    # Root sessions
+    local root_sessions
+    root_sessions=$(echo "$sessions" | awk '$1=="root"' || true)
+    if [ -n "$root_sessions" ]; then
+        flag "Root is directly logged in — root should not have interactive SSH sessions."
+        fix "Disable root SSH: set 'PermitRootLogin no' in /etc/ssh/sshd_config, then: sudo systemctl restart ssh"
+    else
+        ok "No direct root sessions."
     fi
+
+    # Unexpected users (anyone other than expected ubuntu/admin user)
+    local current_user
+    current_user=$(whoami)
+    local unexpected_users
+    unexpected_users=$(echo "$sessions" | awk -v u="$current_user" '$1 != u && $1 != "root" {print $1}' | sort -u || true)
+    if [ -n "$unexpected_users" ]; then
+        flag "Unexpected user(s) currently logged in:"
+        while IFS= read -r u; do
+            flag "  User: ${BOLD}$u${RESET}"
+            fix "Terminate their sessions: sudo pkill -u $u && sudo passwd -l $u"
+        done <<< "$unexpected_users"
+    else
+        ok "Only expected user(s) are logged in."
+    fi
+
+    # Sessions from multiple distinct IPs simultaneously
+    local active_ips
+    active_ips=$(echo "$sessions" | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+    local ip_count
+    ip_count=$(echo "$active_ips" | grep -c '.' 2>/dev/null || echo 0)
+    if [ "$ip_count" -gt 1 ]; then
+        warn "$ip_count different IPs have active sessions simultaneously:"
+        while IFS= read -r ip; do warn "  ${BOLD}$ip${RESET}"; done <<< "$active_ips"
+        fix "If any IP is unrecognised, kill their session: sudo pkill -9 -u <user>"
+    elif [ "$ip_count" -eq 1 ]; then
+        ok "All active sessions from a single IP: ${BOLD}$(echo "$active_ips")${RESET}"
+    fi
+
+    # Long-running sessions (idle > 1 hour — column 5 is IDLE in w output)
+    local idle_sessions
+    idle_sessions=$(echo "$sessions" | awk '$5 ~ /^[0-9]+:[0-9]+/ && substr($5,1,2)+0 >= 1 {print $1, $3, "idle", $5}' || true)
+    [ -n "$idle_sessions" ] && warn "Long-idle session(s) detected (may be a forgotten open connection):" \
+        && while IFS= read -r l; do warn "  $l"; done <<< "$idle_sessions"
+
     pause
 }
 
 check_login_history() {
     header "Recent Login History"
     desc "Lists the last 20 logins with timestamps and source IP addresses."
-    desc "Look for logins at unusual times or from unknown locations."
     local output
     output=$(last -n 20)
     echo "$output"
     echo
 
     analysis_header
-    local unique_ips
-    unique_ips=$(echo "$output" | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
-    local unique_users
-    unique_users=$(echo "$output" | awk '{print $1}' | grep -vE '^(reboot|wtmp|$)' | sort -u)
-    local reboot_count
-    reboot_count=$(echo "$output" | grep -c 'reboot' || true)
+    # Extract IPs and timestamps from successful logins
+    local login_lines
+    login_lines=$(echo "$output" | grep -v 'reboot\|wtmp\|^$' | head -20)
 
-    if [ -z "$unique_ips" ]; then
-        info "No external IP logins found in this sample."
+    local unique_ips
+    unique_ips=$(echo "$login_lines" | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+    local ip_count
+    ip_count=$(echo "$unique_ips" | grep -c '.' 2>/dev/null || echo 0)
+
+    # Unusual hours — logins between midnight and 5am
+    local odd_hour_logins
+    odd_hour_logins=$(echo "$login_lines" | awk '{
+        for(i=1;i<=NF;i++) if($i ~ /^[0-2][0-9]:[0-5][0-9]$/) {
+            h=substr($i,1,2)+0
+            if(h>=0 && h<5) print $0
+        }
+    }' || true)
+
+    # Multiple IPs
+    if [ "$ip_count" -eq 0 ]; then
+        ok "No external IP logins in this sample (key-based or local logins only)."
+    elif [ "$ip_count" -eq 1 ]; then
+        ok "All logins from a single IP address: ${BOLD}$(echo "$unique_ips")${RESET} — consistent with one admin location."
+    elif [ "$ip_count" -le 3 ]; then
+        warn "$ip_count distinct source IPs — expected if you connect from multiple locations, suspicious otherwise:"
+        while IFS= read -r ip; do info "  ${BOLD}$ip${RESET}"; done <<< "$unique_ips"
     else
-        ok "Unique source IPs in history:"
-        while IFS= read -r ip; do
-            info "  ${BOLD}$ip${RESET}"
-        done <<< "$unique_ips"
-        local ip_count
-        ip_count=$(echo "$unique_ips" | grep -c '.' || true)
-        [ "$ip_count" -gt 3 ] && warn "$ip_count distinct IPs — expected if you access from multiple locations, suspicious otherwise."
+        flag "$ip_count distinct source IPs in recent login history — unusually high."
+        fix "Review each IP. Block unknowns with: sudo ufw deny from <ip>"
+        while IFS= read -r ip; do info "  ${BOLD}$ip${RESET}"; done <<< "$unique_ips"
     fi
-    [ -n "$unique_users" ] && info "Users seen in login history: $(echo "$unique_users" | tr '\n' ' ')"
-    [ "$reboot_count" -gt 3 ] \
-        && warn "$reboot_count reboots in recent history — could indicate crashes or forced restarts." \
-        || ok "$reboot_count reboot(s) in recent history — normal."
+
+    # Off-hours logins
+    if [ -n "$odd_hour_logins" ]; then
+        warn "Login(s) detected between midnight and 5am — verify these were you:"
+        while IFS= read -r l; do warn "  $l"; done <<< "$odd_hour_logins"
+        fix "If unexpected, check accepted logins immediately: grep 'Accepted' /var/log/auth.log"
+    else
+        ok "No logins detected during unusual hours (midnight–5am)."
+    fi
+
+    # Rapid consecutive reboots
+    local reboot_count
+    reboot_count=$(echo "$output" | grep -c 'reboot' || echo 0)
+    if [ "$reboot_count" -ge 5 ]; then
+        warn "$reboot_count reboots in recent history — could indicate crashes, OOM kills, or an attacker rebooting to clear state."
+        fix "Check kernel logs for OOM or panic: sudo journalctl -k -b -1 | tail -30"
+    fi
+
     pause
 }
 
 check_failed_logins() {
     header "Failed Login Attempts"
     desc "Scans auth.log for failed SSH password attempts."
-    desc "A flood of failures from a single IP indicates a brute-force attack."
     local output
     output=$(grep 'Failed password' /var/log/auth.log 2>/dev/null | tail -30)
-    if [ -z "$output" ]; then
-        echo "(no failed password attempts found in auth.log)"
-    else
-        echo "$output"
-    fi
+    [ -n "$output" ] && echo "$output" || echo "(no failed password attempts in auth.log)"
     echo
 
     analysis_header
     local total
     total=$(grep -c 'Failed password' /var/log/auth.log 2>/dev/null || echo 0)
+
+    # Top attacking IPs with counts
     local top_ips
     top_ips=$(grep 'Failed password' /var/log/auth.log 2>/dev/null \
         | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
         | awk '{print $2}' | sort | uniq -c | sort -rn | head -5)
+
+    # Most targeted usernames
     local top_users
     top_users=$(grep 'Failed password' /var/log/auth.log 2>/dev/null \
-        | grep -oP 'for (invalid user )?\K\S+' | sort | uniq -c | sort -rn | head -5)
+        | grep -oP '(?<=for (invalid user )?)\S+(?= from)' \
+        | sort | uniq -c | sort -rn | head -5)
 
+    # Assess severity
     if [ "$total" -eq 0 ]; then
-        ok "No failed login attempts found."
-    elif [ "$total" -lt 20 ]; then
-        warn "$total failed attempt(s) total — low level, possibly just noise."
-    elif [ "$total" -lt 200 ]; then
-        warn "$total failed attempts — moderate. Monitor for increases."
+        ok "No failed login attempts on record."
+    elif [ "$total" -lt 50 ]; then
+        ok "$total failed attempt(s) — low noise level, likely just background internet scanning."
+    elif [ "$total" -lt 500 ]; then
+        warn "$total failed attempts — moderate. Your server is being probed."
+        fix "Install fail2ban to auto-block repeat offenders: sudo apt install fail2ban -y"
     else
-        flag "$total failed attempts — this server is under active brute-force attack."
-        info "Consider installing fail2ban: sudo apt install fail2ban"
+        flag "$total failed attempts — your server is under sustained brute-force attack."
+        fix "Immediately install fail2ban: sudo apt install fail2ban -y && sudo systemctl enable --now fail2ban"
+        fix "Also disable password auth entirely: set 'PasswordAuthentication no' in /etc/ssh/sshd_config"
     fi
 
+    # Per-IP breakdown
     if [ -n "$top_ips" ]; then
-        info "Top offending IPs:"
+        info "Top attacking IPs:"
         while IFS= read -r line; do
             local count ip
             count=$(echo "$line" | awk '{print $1}')
             ip=$(echo "$line" | awk '{print $2}')
-            [ "$count" -gt 50 ] \
-                && flag "  $count attempts from ${BOLD}$ip${RESET} — consider blocking with: ufw deny from $ip" \
-                || warn "  $count attempts from ${BOLD}$ip${RESET}"
+            if [ "$count" -gt 100 ]; then
+                flag "  ${BOLD}$count${RESET} attempts from ${BOLD}$ip${RESET}"
+                fix "  Block now: sudo ufw deny from $ip to any && sudo ufw reload"
+            elif [ "$count" -gt 20 ]; then
+                warn "  ${BOLD}$count${RESET} attempts from ${BOLD}$ip${RESET}"
+            else
+                info "  $count attempts from $ip"
+            fi
         done <<< "$top_ips"
     fi
 
+    # Invalid usernames being tried — indicates credential stuffing
     if [ -n "$top_users" ]; then
-        info "Most targeted usernames:"
+        local invalid_count
+        invalid_count=$(grep 'invalid user' /var/log/auth.log 2>/dev/null | wc -l)
+        if [ "$invalid_count" -gt 10 ]; then
+            warn "$invalid_count attempts for non-existent usernames — credential stuffing or user enumeration."
+            info "Most targeted usernames (real and invalid):"
+        else
+            info "Most targeted usernames:"
+        fi
         while IFS= read -r line; do
-            info "  $(echo "$line" | awk '{print $1}') attempts for user '$(echo "$line" | awk '{print $2}')'"
+            info "  $(echo "$line" | awk '{print $1}') attempts → user '$(echo "$line" | awk '{print $2}')'"
         done <<< "$top_users"
     fi
+
+    # Check if fail2ban is already running
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        ok "fail2ban is active — repeat offenders are being automatically blocked."
+        local banned
+        banned=$(sudo fail2ban-client status sshd 2>/dev/null | grep 'Banned IP' | awk -F: '{print $2}' | xargs)
+        [ -n "$banned" ] && info "Currently banned IPs: $banned"
+    else
+        warn "fail2ban is not running — failed logins are not being automatically blocked."
+        fix "sudo apt install fail2ban -y && sudo systemctl enable --now fail2ban"
+    fi
+
     pause
 }
 
 check_accepted_logins() {
     header "Successful Logins"
-    desc "Shows SSH logins that were accepted. Any login you did not initiate"
-    desc "yourself is the clearest sign of an intruder."
+    desc "Shows SSH logins that were accepted. Any login you did not initiate is an intruder."
     local output
     output=$(grep 'Accepted' /var/log/auth.log 2>/dev/null | tail -20)
-    if [ -z "$output" ]; then
-        echo "(no accepted logins found in auth.log)"
-    else
-        echo "$output"
-    fi
+    [ -n "$output" ] && echo "$output" || echo "(no accepted logins in auth.log)"
     echo
 
     analysis_header
     local total
     total=$(grep -c 'Accepted' /var/log/auth.log 2>/dev/null || echo 0)
     local pw_logins
-    pw_logins=$(grep 'Accepted password' /var/log/auth.log 2>/dev/null | wc -l)
+    pw_logins=$(grep -c 'Accepted password' /var/log/auth.log 2>/dev/null || echo 0)
     local key_logins
-    key_logins=$(grep 'Accepted publickey' /var/log/auth.log 2>/dev/null | wc -l)
-    local unique_ips
-    unique_ips=$(grep 'Accepted' /var/log/auth.log 2>/dev/null \
-        | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | sort -u)
+    key_logins=$(grep -c 'Accepted publickey' /var/log/auth.log 2>/dev/null || echo 0)
     local root_logins
     root_logins=$(grep 'Accepted' /var/log/auth.log 2>/dev/null | grep 'for root' || true)
 
-    [ "$total" -eq 0 ] && ok "No accepted logins on record." || info "$total accepted login(s) total."
-    [ "$key_logins" -gt 0 ] && ok "$key_logins login(s) via SSH key (secure)."
+    # Auth method breakdown
+    [ "$key_logins" -gt 0 ] && ok "$key_logins login(s) via SSH public key (most secure method)."
     if [ "$pw_logins" -gt 0 ]; then
-        flag "$pw_logins login(s) via password — password auth should be disabled in sshd_config."
-        info "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config"
+        flag "$pw_logins login(s) authenticated via password — passwords are vulnerable to brute-force."
+        fix "Disable password auth: set 'PasswordAuthentication no' in /etc/ssh/sshd_config, then restart ssh"
     fi
-    [ -n "$root_logins" ] && flag "Direct root login(s) detected — root SSH access should be disabled." \
-        || ok "No direct root logins found."
-    if [ -n "$unique_ips" ]; then
-        info "IPs that have successfully logged in:"
+
+    # Root logins
+    if [ -n "$root_logins" ]; then
+        flag "Direct root login(s) detected — attackers always target root first."
+        fix "Set 'PermitRootLogin no' in /etc/ssh/sshd_config, then: sudo systemctl restart ssh"
+        while IFS= read -r l; do flag "  $l"; done <<< "$root_logins"
+    else
+        ok "No direct root logins on record."
+    fi
+
+    # Source IP analysis — flag if more than expected distinct IPs
+    local all_ips
+    all_ips=$(grep 'Accepted' /var/log/auth.log 2>/dev/null \
+        | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | sort -u)
+    local ip_count
+    ip_count=$(echo "$all_ips" | grep -c '.' 2>/dev/null || echo 0)
+
+    if [ "$ip_count" -eq 0 ]; then
+        [ "$total" -gt 0 ] && info "No external IPs found — logins may be from localhost or internal network."
+    elif [ "$ip_count" -eq 1 ]; then
+        ok "All successful logins from a single IP: ${BOLD}$(echo "$all_ips")${RESET}"
+    else
+        warn "$ip_count distinct IPs have successfully logged in — verify every one of these:"
         while IFS= read -r ip; do
-            info "  ${BOLD}$ip${RESET} — verify this is a known address."
-        done <<< "$unique_ips"
+            warn "  ${BOLD}$ip${RESET}"
+            fix "  Restrict SSH to known IPs: sudo ufw allow from $ip to any port 22"
+        done <<< "$all_ips"
+        fix "After allowlisting your IP, block all others: sudo ufw deny 22"
     fi
+
+    # Recent logins in the last hour (timestamps in auth.log — approximate)
+    local recent
+    recent=$(grep 'Accepted' /var/log/auth.log 2>/dev/null | tail -5)
+    if [ -n "$recent" ]; then
+        info "5 most recent successful logins:"
+        while IFS= read -r l; do info "  $l"; done <<< "$recent"
+    fi
+
     pause
 }
 
 check_ssh_keys() {
     header "Authorized SSH Keys"
-    desc "Lists public keys allowed to log in as your user and as root."
-    desc "Any key you do not recognize could be an attacker's backdoor."
+    desc "Lists public keys permitted to log in. Any unrecognised key is a backdoor."
 
     local user_keys root_keys
-    user_keys=$(cat ~/.ssh/authorized_keys 2>/dev/null)
-    root_keys=$(sudo cat /root/.ssh/authorized_keys 2>/dev/null)
+    user_keys=$(cat ~/.ssh/authorized_keys 2>/dev/null || true)
+    root_keys=$(sudo cat /root/.ssh/authorized_keys 2>/dev/null || true)
 
     echo -e "${GREEN}\$ cat ~/.ssh/authorized_keys${RESET}"
-    [ -n "$user_keys" ] && echo "$user_keys" || echo "(no keys found)"
+    [ -n "$user_keys" ] && echo "$user_keys" || echo "(none)"
     echo
     echo -e "${GREEN}\$ sudo cat /root/.ssh/authorized_keys${RESET}"
-    [ -n "$root_keys" ] && echo "$root_keys" || echo "(no keys found for root)"
+    [ -n "$root_keys" ] && echo "$root_keys" || echo "(none)"
     echo
 
     analysis_header
-    local user_count=0 root_count=0
-    [ -n "$user_keys" ] && user_count=$(echo "$user_keys" | grep -c 'ssh-' || true)
-    [ -n "$root_keys" ] && root_count=$(echo "$root_keys" | grep -c 'ssh-' || true)
 
-    [ "$user_count" -eq 0 ] && info "No authorized keys for current user." \
-        || ok "$user_count authorized key(s) for current user — verify each is intentional."
-    if [ "$root_count" -gt 0 ]; then
-        warn "$root_count authorized key(s) for root — root key login is a security risk if not required."
+    # Analyse each key: type, bits, comment
+    _analyse_keys() {
+        local label="$1" keys="$2"
+        local count
+        count=$(echo "$keys" | grep -cE '^(ssh-|ecdsa-|sk-)' 2>/dev/null || echo 0)
+        [ "$count" -eq 0 ] && ok "No authorized keys for $label." && return
+
+        ok "$count authorized key(s) for $label:"
+        while IFS= read -r keyline; do
+            [[ "$keyline" =~ ^(ssh-|ecdsa-|sk-) ]] || continue
+            local keytype comment
+            keytype=$(echo "$keyline" | awk '{print $1}')
+            comment=$(echo "$keyline" | awk '{print $3}')
+            [ -z "$comment" ] && comment="(no comment)"
+
+            case "$keytype" in
+                ssh-ed25519|sk-ssh-ed25519*)
+                    ok "  ${BOLD}$comment${RESET} — Ed25519 key (modern, strong)" ;;
+                ecdsa-sha2-*|sk-ecdsa-*)
+                    ok "  ${BOLD}$comment${RESET} — ECDSA key (good)" ;;
+                ssh-rsa)
+                    # Try to get key length
+                    local bits
+                    bits=$(echo "$keyline" | ssh-keygen -l -f /dev/stdin 2>/dev/null | awk '{print $1}' || echo "?")
+                    if [ "$bits" != "?" ] && [ "$bits" -lt 2048 ] 2>/dev/null; then
+                        flag "  ${BOLD}$comment${RESET} — RSA key only ${BOLD}${bits}-bit${RESET} (too weak, must be ≥2048)"
+                        fix "  Regenerate: ssh-keygen -t ed25519 -C 'your@email'"
+                    elif [ "$bits" != "?" ] && [ "$bits" -lt 4096 ] 2>/dev/null; then
+                        warn "  ${BOLD}$comment${RESET} — RSA ${bits}-bit (acceptable, but Ed25519 is preferred)"
+                    else
+                        ok "  ${BOLD}$comment${RESET} — RSA key"
+                    fi
+                    ;;
+                ssh-dss)
+                    flag "  ${BOLD}$comment${RESET} — DSA key (${BOLD}obsolete and broken${RESET}, remove immediately)"
+                    fix "  Remove this key and regenerate: ssh-keygen -t ed25519 -C 'your@email'" ;;
+                *)
+                    warn "  ${BOLD}$comment${RESET} — unknown key type: $keytype" ;;
+            esac
+        done <<< "$keys"
+
+        # Warn if no comment — makes keys hard to audit
+        local no_comment
+        no_comment=$(echo "$keys" | grep -cE '^(ssh-|ecdsa-|sk-)[^ ]+ [^ ]+$' 2>/dev/null || echo 0)
+        [ "$no_comment" -gt 0 ] && warn "  $no_comment key(s) have no comment — add comments so you can identify which device each key belongs to."
+    }
+
+    _analyse_keys "current user ($(whoami))" "$user_keys"
+    echo
+    if [ -n "$root_keys" ]; then
+        flag "Root has authorized SSH keys — direct root login via key is possible."
+        fix "Remove root keys and use sudo instead: sudo rm /root/.ssh/authorized_keys"
+        _analyse_keys "root" "$root_keys"
     else
         ok "No authorized keys for root."
     fi
-    info "If you see an unfamiliar key, remove it immediately and rotate your own keys."
+
+    # Check for keys in unusual home directories
+    local other_keys
+    other_keys=$(sudo find /home -name authorized_keys 2>/dev/null | grep -v "$(whoami)" || true)
+    if [ -n "$other_keys" ]; then
+        info "authorized_keys files found for other users:"
+        while IFS= read -r f; do
+            local kcount
+            kcount=$(sudo grep -cE '^(ssh-|ecdsa-|sk-)' "$f" 2>/dev/null || echo 0)
+            info "  $f ($kcount key(s))"
+        done <<< "$other_keys"
+    fi
+
     pause
 }
 
 check_ssh_config() {
     header "SSH Daemon Configuration"
-    desc "Checks key SSH settings: whether root login is permitted,"
-    desc "whether password auth is enabled (riskier than key-only), and the port."
+    desc "Reviews sshd settings for security misconfigurations."
     local output
-    output=$(sudo sshd -T 2>/dev/null | grep -E 'permitrootlogin|passwordauth|port|pubkeyauth|maxauthtries|logingracetime')
-    echo "$output"
+    output=$(sudo sshd -T 2>/dev/null)
+    echo "$output" | grep -E 'permitrootlogin|passwordauth|port|pubkeyauth|maxauthtries|logingracetime|permitemptypasswords|x11forwarding|allowtcpforwarding|clientaliveinterval|banner'
     echo
 
     analysis_header
-    local root_login pw_auth port pubkey max_tries grace
-    root_login=$(echo "$output" | grep 'permitrootlogin' | awk '{print $2}')
-    pw_auth=$(echo "$output" | grep 'passwordauthentication' | awk '{print $2}')
-    port=$(echo "$output" | grep '^port ' | awk '{print $2}')
-    pubkey=$(echo "$output" | grep 'pubkeyauthentication' | awk '{print $2}')
-    max_tries=$(echo "$output" | grep 'maxauthtries' | awk '{print $2}')
-    grace=$(echo "$output" | grep 'logingracetime' | awk '{print $2}')
+    _val() { echo "$output" | grep "^$1 " | awk '{print $2}'; }
 
+    local root_login;    root_login=$(_val permitrootlogin)
+    local pw_auth;       pw_auth=$(_val passwordauthentication)
+    local port;          port=$(_val port)
+    local pubkey;        pubkey=$(_val pubkeyauthentication)
+    local max_tries;     max_tries=$(_val maxauthtries)
+    local grace;         grace=$(_val logingracetime)
+    local empty_pw;      empty_pw=$(_val permitemptypasswords)
+    local x11;           x11=$(_val x11forwarding)
+    local tcp_fwd;       tcp_fwd=$(_val allowtcpforwarding)
+    local alive;         alive=$(_val clientaliveinterval)
+    local banner;        banner=$(_val banner)
+
+    # Root login
     case "$root_login" in
-        no)        ok "PermitRootLogin is disabled." ;;
-        yes)       flag "PermitRootLogin is YES — root can log in directly over SSH. Set to 'no'." ;;
-        prohibit-password) warn "PermitRootLogin is 'prohibit-password' — root can log in with a key. Consider setting to 'no'." ;;
-        *)         info "PermitRootLogin: ${root_login:-unknown}" ;;
+        no)                 ok "PermitRootLogin no — root cannot log in over SSH." ;;
+        yes)                flag "PermitRootLogin yes — root can log in with a password over SSH."
+                            fix "Set 'PermitRootLogin no' in /etc/ssh/sshd_config" ;;
+        prohibit-password)  warn "PermitRootLogin prohibit-password — root can log in with an SSH key."
+                            fix "Set 'PermitRootLogin no' unless you specifically need root key access." ;;
+        forced-commands-only) info "PermitRootLogin forced-commands-only — root access limited to specific commands." ;;
     esac
 
+    # Password auth
     case "$pw_auth" in
-        no)  ok "PasswordAuthentication is disabled — key-only login enforced." ;;
-        yes) flag "PasswordAuthentication is YES — brute-force attacks are possible. Set to 'no' and use SSH keys only." ;;
-        *)   info "PasswordAuthentication: ${pw_auth:-unknown}" ;;
+        no)  ok "PasswordAuthentication no — only SSH keys accepted (most secure)." ;;
+        yes) flag "PasswordAuthentication yes — password logins allowed, enabling brute-force attacks."
+             fix "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config, ensure your key is in authorized_keys first." ;;
     esac
 
-    [ "$pubkey" = "yes" ] && ok "PubkeyAuthentication is enabled." \
-        || warn "PubkeyAuthentication may be disabled — ensure you have another way in before changing settings."
+    # Empty passwords
+    [ "$empty_pw" = "yes" ] && flag "PermitEmptyPasswords yes — accounts with no password can log in!" \
+        && fix "Set 'PermitEmptyPasswords no' immediately."
 
+    # Public key auth
+    [ "$pubkey" = "no" ] && flag "PubkeyAuthentication is disabled — SSH key login won't work." \
+        && fix "Set 'PubkeyAuthentication yes'" \
+        || ok "PubkeyAuthentication yes — SSH key login enabled."
+
+    # Port
     if [ "$port" = "22" ]; then
-        warn "SSH is on default port 22 — bots actively scan this port. Changing to a non-standard port reduces noise."
+        warn "SSH on default port 22 — automated bots scan this port constantly."
+        fix "Change to a high port (e.g. 2222) in /etc/ssh/sshd_config to reduce scan noise. Update firewall rules too."
     else
-        ok "SSH is on non-standard port $port — reduces automated scan traffic."
+        ok "SSH on non-default port $port — reduces automated scan traffic."
     fi
 
-    [ -n "$max_tries" ] && [ "$max_tries" -gt 4 ] \
-        && warn "MaxAuthTries is $max_tries — consider reducing to 3 to limit brute-force attempts." \
-        || ok "MaxAuthTries is ${max_tries:-default} — acceptable."
+    # MaxAuthTries
+    if [ -n "$max_tries" ] && [ "$max_tries" -gt 3 ] 2>/dev/null; then
+        warn "MaxAuthTries $max_tries — allows $max_tries failed attempts per connection before disconnecting."
+        fix "Set 'MaxAuthTries 3' in /etc/ssh/sshd_config"
+    else
+        ok "MaxAuthTries ${max_tries:-default (6)} — acceptable."
+    fi
+
+    # LoginGraceTime
+    if [ -n "$grace" ] && [ "$grace" -gt 30 ] 2>/dev/null; then
+        warn "LoginGraceTime ${grace}s — long window for unauthenticated connections to linger."
+        fix "Set 'LoginGraceTime 20' in /etc/ssh/sshd_config"
+    else
+        ok "LoginGraceTime ${grace:-default} — acceptable."
+    fi
+
+    # X11 forwarding (attack surface if not needed)
+    [ "$x11" = "yes" ] && warn "X11Forwarding yes — increases attack surface if you don't need GUI forwarding." \
+        && fix "Set 'X11Forwarding no' unless you need to forward graphical applications."
+
+    # TCP forwarding (can be abused to tunnel traffic)
+    [ "$tcp_fwd" = "yes" ] && warn "AllowTcpForwarding yes — SSH tunnelling is enabled. Can be abused to bypass firewall rules." \
+        && fix "Set 'AllowTcpForwarding no' if you don't use SSH port forwarding."
+
+    # Client keepalive
+    if [ -z "$alive" ] || [ "$alive" -eq 0 ] 2>/dev/null; then
+        warn "ClientAliveInterval not set — idle sessions stay open indefinitely."
+        fix "Add 'ClientAliveInterval 300' and 'ClientAliveCountMax 2' to /etc/ssh/sshd_config"
+    else
+        ok "ClientAliveInterval ${alive}s — idle sessions will eventually time out."
+    fi
+
+    # Login banner
+    [ -z "$banner" ] || [ "$banner" = "none" ] && info "No SSH login banner configured." \
+        || ok "SSH login banner is set: $banner"
 
     pause
 }
 
 check_processes() {
     header "All Running Processes"
-    desc "Full process tree showing every running process, its owner, and CPU/memory."
-    desc "Look for unfamiliar names, especially running as root, or high CPU usage."
+    desc "Full process tree with CPU and memory usage."
     local output
     output=$(ps auxf)
     echo "$output"
     echo
 
     analysis_header
-    # Known miner names
-    local miner_names=("xmrig" "minerd" "kdevtmpfsi" "kthreaddi" "sysupdate" "networkservice" "cryptonight")
-    local found_miners=0
+
+    # Known miner process names (exact and partial)
+    local miner_names=("xmrig" "minerd" "kdevtmpfsi" "kthreaddi" "sysupdate"
+        "networkservice" "cryptonight" "cpuminer" "ccminer" "bfgminer"
+        "cgminer" "ethminer" "claymore" "phoenixminer" "lolminer")
+    local found_miner=0
     for name in "${miner_names[@]}"; do
-        local matches
-        matches=$(echo "$output" | grep -v grep | grep "$name" || true)
-        if [ -n "$matches" ]; then
-            flag "Possible miner process found: ${BOLD}$name${RESET}"
-            echo "$matches"
-            found_miners=1
+        local match
+        match=$(echo "$output" | grep -v 'grep\|server_audit' | grep -i "$name" | grep -v '\[' || true)
+        if [ -n "$match" ]; then
+            flag "Known miner process name detected: ${BOLD}$name${RESET}"
+            echo "$match"
+            fix "Kill it: sudo pkill -f $name && sudo find / -name '$name' -delete 2>/dev/null"
+            found_miner=1
         fi
     done
-    [ "$found_miners" -eq 0 ] && ok "No known crypto miner process names detected."
+    [ "$found_miner" -eq 0 ] && ok "No known crypto miner process names found."
 
-    # High CPU processes (>50%)
-    local high_cpu
-    high_cpu=$(echo "$output" | awk 'NR>1 && $3>50 {print $1, $3"% CPU", $11}')
-    if [ -n "$high_cpu" ]; then
-        warn "Processes using >50% CPU:"
-        while IFS= read -r line; do warn "  $line"; done <<< "$high_cpu"
+    # Processes with deleted executables — classic fileless malware indicator
+    local deleted_exes
+    deleted_exes=$(ls -la /proc/*/exe 2>/dev/null | grep '(deleted)' | awk '{print $NF}' | sed 's/ (deleted)//' || true)
+    if [ -n "$deleted_exes" ]; then
+        flag "Process(es) running from deleted executables — strong indicator of fileless malware:"
+        while IFS= read -r d; do
+            local pid
+            pid=$(echo "$d" | grep -oE '/proc/[0-9]+' | grep -oE '[0-9]+')
+            local pname
+            pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            flag "  PID $pid ($pname): $d"
+            fix "  Investigate: ls -la /proc/$pid/exe && cat /proc/$pid/cmdline | tr '\\0' ' '"
+        done <<< "$deleted_exes"
     else
-        ok "No processes with unexpectedly high CPU usage."
+        ok "No processes running from deleted executables."
     fi
 
-    # Processes with no TTY running as non-system users (could be unexpected daemons)
-    local unexpected
-    unexpected=$(echo "$output" | awk 'NR>1 && $7=="?" && $1!="root" && $1!="www-data" && $1!="systemd+" && $1!="syslog" && $1!="_chrony" && $1!="message+" && $1!="polkitd" && $1!="ubuntu" && $1!="nobody" {print $1, $11}' | sort -u)
-    if [ -n "$unexpected" ]; then
-        warn "Background processes running as non-standard users (review these):"
-        while IFS= read -r line; do info "  $line"; done <<< "$unexpected"
+    # High CPU usage (>50%) by non-kernel processes
+    local high_cpu
+    high_cpu=$(echo "$output" | awk 'NR>1 && $3>50 && $11!~/^\[/ {printf "  PID %-6s  CPU %-6s  User %-10s  %s\n", $2, $3"%", $1, $11}')
+    if [ -n "$high_cpu" ]; then
+        warn "Process(es) consuming >50% CPU — miners always show here:"
+        echo "$high_cpu"
+        fix "Investigate high-CPU process: sudo lsof -p <PID> && cat /proc/<PID>/cmdline | tr '\\0' ' '"
+    else
+        ok "No non-kernel processes with >50% CPU usage."
     fi
+
+    # Processes running as root that aren't kernel threads and aren't in a known list
+    local known_root=("systemd" "sshd" "cron" "nginx" "rsyslogd" "agetty" "multipathd"
+        "snapd" "amazon-ssm" "udisksd" "ModemManager" "polkitd" "irqbalance"
+        "chronyd" "unattended" "networkd-dispatcher" "python3" "udevd" "journald"
+        "logind" "acpid" "dbus-daemon" "init" "bash" "sh" "ps" "grep" "awk")
+    local suspicious_root
+    suspicious_root=$(echo "$output" | awk 'NR>1 && $1=="root" && $11!~/^\[/ {print $2, $11}' | while read -r pid cmd; do
+        base=$(basename "$cmd" 2>/dev/null || echo "$cmd")
+        known=0
+        for k in "${known_root[@]}"; do [[ "$base" == *"$k"* ]] && known=1 && break; done
+        [ "$known" -eq 0 ] && echo "  PID $pid: $cmd"
+    done || true)
+    if [ -n "$suspicious_root" ]; then
+        warn "Root processes not in the known-legitimate list (review these):"
+        echo "$suspicious_root"
+        fix "Investigate unknown root process: sudo lsof -p <PID>"
+    fi
+
     pause
 }
 
 check_ports() {
     header "Listening Ports"
-    desc "Shows all TCP/UDP ports the server is listening on, and which process owns each."
-    desc "Any unexpected open port could be a backdoor or rogue service."
+    desc "Shows all ports the server is listening on, correlated with the owning process."
     local output
     output=$(ss -tulpn)
     echo "$output"
     echo
 
     analysis_header
-    # Ports exposed on 0.0.0.0 or :: (all interfaces = public)
-    local public_ports
-    public_ports=$(echo "$output" | grep -E '0\.0\.0\.0:|:::' | grep LISTEN)
-    local local_only
-    local_only=$(echo "$output" | grep -E '127\.' | grep LISTEN)
 
-    local known_ports=(22 80 443 8080 8443)
-    local flagged=0
+    # Extract publicly exposed ports (0.0.0.0 or ::) with process names
+    local public
+    public=$(echo "$output" | grep -E '(0\.0\.0\.0|:::| \*:)' | grep LISTEN)
+
+    # Ports we expect on a typical Ubuntu web server
+    local expected_ports=(22 80 443 8080 8443)
+    local flagged_ports=0
 
     while IFS= read -r line; do
-        local port
-        port=$(echo "$line" | grep -oE ':[0-9]+' | head -1 | tr -d ':')
-        local known=0
-        for k in "${known_ports[@]}"; do [ "$port" = "$k" ] && known=1 && break; done
-        if [ "$known" -eq 0 ] && [ -n "$port" ]; then
-            warn "Port ${BOLD}$port${RESET} is publicly exposed — verify this service is intentional."
-            flagged=1
+        [ -z "$line" ] && continue
+        local port process
+        port=$(echo "$line" | grep -oE ':[0-9]+\s' | head -1 | tr -d ': ')
+        process=$(echo "$line" | grep -oP '(?<=users:\(\(")[^"]+' || echo "unknown")
+
+        local expected=0
+        for e in "${expected_ports[@]}"; do [ "$port" = "$e" ] && expected=1 && break; done
+
+        if [ "$expected" -eq 1 ]; then
+            ok "Port ${BOLD}$port${RESET} ($process) — expected."
+        else
+            warn "Port ${BOLD}$port${RESET} ($process) is publicly exposed — verify this is intentional."
+            fix "If not needed: sudo ufw deny $port && sudo systemctl stop <service>"
+            flagged_ports=$(( flagged_ports + 1 ))
         fi
-    done <<< "$public_ports"
+    done <<< "$public"
 
-    [ "$flagged" -eq 0 ] && ok "All publicly exposed ports are in the expected set (22, 80, 443)."
+    [ "$flagged_ports" -eq 0 ] && ok "All publicly exposed ports are in the expected set."
 
-    local lcount
-    lcount=$(echo "$local_only" | grep -c '.' 2>/dev/null || true)
-    [ "$lcount" -gt 0 ] && ok "$lcount port(s) listening on localhost only — not exposed externally."
+    # Ports only on localhost — informational
+    local local_count
+    local_count=$(echo "$output" | grep -c '127\.' || echo 0)
+    [ "$local_count" -gt 0 ] && ok "$local_count port(s) on localhost only — not reachable externally."
 
-    # Check for anything on suspicious high ports
-    local high_ports
-    high_ports=$(echo "$output" | grep LISTEN | grep -oE ':[0-9]+' | tr -d ':' | awk '$1>10000 && $1!=65535')
-    [ -n "$high_ports" ] && warn "High port(s) listening: $high_ports — verify these are expected." \
-        || ok "No unexpected high-numbered ports detected."
+    # High ports (>10000) exposed publicly — unusual
+    local high_public
+    high_public=$(echo "$public" | grep -oE ':[0-9]+' | tr -d ':' | awk '$1>10000')
+    if [ -n "$high_public" ]; then
+        warn "High port(s) exposed publicly: $high_public"
+        fix "Confirm these belong to legitimate services. If unknown: sudo ss -tulpn | grep <port>"
+    fi
+
     pause
 }
 
 check_outbound() {
     header "Established Outbound Connections"
-    desc "Shows active connections your server has opened to external hosts."
-    desc "Malware (especially crypto miners) maintains persistent outbound connections."
+    desc "Active connections this server has opened to external hosts."
     local output
     output=$(ss -tupn state established 2>/dev/null)
     echo "$output"
     echo
 
     analysis_header
+
     local conn_count
-    conn_count=$(echo "$output" | grep -c 'ESTAB' || true)
+    conn_count=$(echo "$output" | grep -c 'ESTAB' 2>/dev/null || echo 0)
 
     if [ "$conn_count" -eq 0 ]; then
         ok "No established outbound connections — clean."
-    else
-        info "$conn_count established connection(s)."
-        # Flag known miner pool ports
-        local miner_ports=(3333 4444 14444 45700 5555 7777 9999 3032)
-        for p in "${miner_ports[@]}"; do
-            local hit
-            hit=$(echo "$output" | grep ":$p" || true)
-            [ -n "$hit" ] && flag "Connection on port $p — known crypto mining pool port!" && echo "$hit"
-        done
-
-        # Show unique remote IPs
-        local remote_ips
-        remote_ips=$(echo "$output" | grep ESTAB | awk '{print $6}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
-        if [ -n "$remote_ips" ]; then
-            info "Remote IPs with active connections:"
-            while IFS= read -r ip; do
-                # Flag private RFC1918 ranges talking back as unexpected
-                if echo "$ip" | grep -qE '^(169\.254\.|100\.[6-9][0-9]\.|100\.1[0-2][0-9]\.)'; then
-                    info "  ${BOLD}$ip${RESET} (link-local / AWS metadata — expected)"
-                else
-                    info "  ${BOLD}$ip${RESET} — verify this destination is expected"
-                fi
-            done <<< "$remote_ips"
-        fi
+        pause
+        return
     fi
+
+    info "$conn_count established connection(s) found."
+
+    # Known miner pool ports
+    local miner_ports=(3333 4444 14444 45700 5555 7777 9999 3032 14433 45560)
+    for p in "${miner_ports[@]}"; do
+        local hit
+        hit=$(echo "$output" | grep ":$p[^0-9]" || true)
+        if [ -n "$hit" ]; then
+            flag "Connection on port $p — this is a well-known crypto mining pool port!"
+            echo "$hit"
+            fix "Kill the process: sudo ss -tulpn | grep $p, then: sudo kill -9 <PID>"
+        fi
+    done
+
+    # Check each unique remote IP
+    local remote_ips
+    remote_ips=$(echo "$output" | grep ESTAB | awk '{print $6}' \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | grep -v '127\.' || true)
+
+    if [ -n "$remote_ips" ]; then
+        info "Unique remote IPs with active connections:"
+        while IFS= read -r ip; do
+            local proc
+            proc=$(echo "$output" | grep "$ip" | grep -oP '(?<=\(\(")[^"]+' | head -1 || echo "unknown")
+            # Flag non-AWS private space connections
+            if echo "$ip" | grep -qE '^(169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'; then
+                ok "  ${BOLD}$ip${RESET} ($proc) — AWS link-local/metadata range, expected."
+            else
+                info "  ${BOLD}$ip${RESET} ($proc)"
+                fix "  Verify: whois $ip  or  curl -s https://ipinfo.io/$ip"
+            fi
+        done <<< "$remote_ips"
+    fi
+
+    # Persistent connections to same IP (could be C2 beacon)
+    local repeated
+    repeated=$(echo "$output" | grep ESTAB | awk '{print $6}' \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort | uniq -c | sort -rn \
+        | awk '$1>3 {print $1, $2}' || true)
+    if [ -n "$repeated" ]; then
+        warn "Multiple connections to the same IP — could indicate C2 beaconing:"
+        while IFS= read -r l; do warn "  $l connections"; done <<< "$repeated"
+        fix "Investigate: sudo ss -tupn | grep <ip>"
+    fi
+
     pause
 }
 
 check_enabled_services() {
     header "Enabled Systemd Services"
-    desc "Lists all services configured to start at boot."
-    desc "Malware often installs itself as a service to survive reboots."
+    desc "Services configured to start automatically at boot."
     local output
     output=$(systemctl list-unit-files --state=enabled 2>/dev/null)
     echo "$output"
     echo
 
     analysis_header
-    local count
-    count=$(echo "$output" | grep -c 'enabled' || true)
-    info "$count enabled service(s) total."
 
-    # Known legitimate Ubuntu/AWS services
-    local known_services=("ssh" "cron" "nginx" "apache2" "ufw" "rsyslog" "chrony" "snapd"
-        "systemd-" "dbus" "NetworkManager" "networkd" "resolved" "logind" "udevd"
-        "multipathd" "unattended-upgrades" "ModemManager" "polkit" "udisks2"
-        "amazon-ssm" "cloud-" "iscsid" "open-iscsi" "irqbalance" "acpid"
-        "apparmor" "apport" "grub" "plymouth" "procps" "rsync" "sysstat"
-        "uuidd" "hibagent" "open-vm-tools" "screen-cleanup")
+    # Known legitimate Ubuntu/AWS service name fragments
+    local known=("ssh" "cron" "nginx" "apache2" "mysql" "postgresql" "redis" "mongodb"
+        "ufw" "rsyslog" "chrony" "ntp" "snapd" "systemd-" "dbus" "network"
+        "resolved" "logind" "udevd" "multipathd" "unattended" "ModemManager"
+        "polkit" "udisks2" "amazon-ssm" "cloud-" "iscsid" "open-iscsi"
+        "irqbalance" "acpid" "apparmor" "apport" "grub" "plymouth" "procps"
+        "rsync" "sysstat" "uuidd" "hibagent" "open-vm-tools" "screen-cleanup"
+        "fail2ban" "docker" "containerd" "kubelet" "php" "node" "gunicorn"
+        "uwsgi" "postfix" "dovecot" "bind9" "named" "avahi" "cups" "bluetooth"
+        "thermald" "fwupd" "packagekit" "gdm" "lightdm" "snap." "lxd")
 
-    local suspicious=0
+    local unknown_services=()
     while IFS= read -r line; do
         local svc
-        svc=$(echo "$line" | awk '{print $1}' | sed 's/\.service$//')
-        [ -z "$svc" ] || [[ "$svc" == "UNIT" ]] && continue
-        local known=0
-        for k in "${known_services[@]}"; do
-            [[ "$svc" == *"$k"* ]] && known=1 && break
-        done
-        if [ "$known" -eq 0 ]; then
-            warn "Unfamiliar enabled service: ${BOLD}$svc${RESET} — verify this is intentional."
-            suspicious=1
-        fi
+        svc=$(echo "$line" | awk '{print $1}')
+        [[ -z "$svc" || "$svc" == "UNIT" || "$svc" == "systemd-"* ]] && continue
+        local k=0
+        for kn in "${known[@]}"; do [[ "$svc" == *"$kn"* ]] && k=1 && break; done
+        [ "$k" -eq 0 ] && unknown_services+=("$svc")
     done <<< "$(echo "$output" | grep 'enabled')"
 
-    [ "$suspicious" -eq 0 ] && ok "All enabled services match known Ubuntu/AWS defaults."
+    if [ "${#unknown_services[@]}" -eq 0 ]; then
+        ok "All enabled services match known legitimate Ubuntu/AWS service patterns."
+    else
+        warn "${#unknown_services[@]} service(s) not in the known-legitimate list — review these:"
+        for s in "${unknown_services[@]}"; do
+            warn "  ${BOLD}$s${RESET}"
+            fix "  Inspect: sudo systemctl status $s && sudo systemctl cat $s"
+        done
+    fi
+
     pause
 }
 
 check_running_services() {
     header "Currently Running Services"
-    desc "Lists only services that are active right now."
+    desc "Services that are active right now."
     local output
     output=$(systemctl list-units --type=service --state=running 2>/dev/null)
     echo "$output"
@@ -605,112 +891,183 @@ check_running_services() {
 
     analysis_header
     local count
-    count=$(echo "$output" | grep -c 'running' || true)
+    count=$(echo "$output" | grep -c 'running' 2>/dev/null || echo 0)
     ok "$count service(s) currently running."
-    info "Cross-reference with your expected stack. If you only run nginx, there should be no mysql, redis, or other unexpected daemons active."
+
+    # Count failed services — a crashed service could indicate a tampered binary that fails to start
+    local failed
+    failed=$(systemctl list-units --type=service --state=failed 2>/dev/null | grep 'failed' || true)
+    if [ -n "$failed" ]; then
+        warn "Failed service(s) detected — a legitimate service crashing can open security gaps:"
+        while IFS= read -r l; do
+            warn "  $l"
+            local svc
+            svc=$(echo "$l" | awk '{print $1}')
+            fix "  Inspect logs: sudo journalctl -u $svc -n 20"
+        done <<< "$failed"
+    else
+        ok "No failed services."
+    fi
+
     pause
 }
 
 check_crontabs() {
     header "Crontabs (All Users)"
-    desc "Scans scheduled tasks for every user on the system."
-    desc "Crypto miners and other malware commonly use cron for persistence."
+    desc "Scheduled tasks for all users — a common malware persistence mechanism."
     local all_crons=""
     local found=0
 
     for u in $(cut -f1 -d: /etc/passwd); do
-        local CRON
-        CRON=$(crontab -u "$u" -l 2>/dev/null | grep -v '^#')
-        if [ -n "$CRON" ]; then
+        local cron
+        cron=$(crontab -u "$u" -l 2>/dev/null | grep -v '^#' || true)
+        if [ -n "$cron" ]; then
             echo -e "${GREEN}[user: $u]${RESET}"
-            echo "$CRON"
+            echo "$cron"
             echo
-            all_crons="${all_crons}\n${CRON}"
+            all_crons="${all_crons}
+${cron}"
             found=1
         fi
     done
     [ "$found" -eq 0 ] && echo "(no user crontabs found)"
     echo
-    desc "System-wide cron directories:"
-    ls -la /etc/cron* /var/spool/cron/crontabs/ 2>/dev/null
+
+    desc "System cron directories:"
+    ls -la /etc/cron.d/ /etc/cron.daily/ /etc/cron.hourly/ /etc/cron.weekly/ 2>/dev/null
     echo
 
     analysis_header
     if [ "$found" -eq 0 ]; then
-        ok "No user crontabs found — clean."
+        ok "No user crontabs — clean."
     else
-        # Look for suspicious patterns in cron entries
-        local suspicious_patterns=("curl" "wget" "bash -i" "/tmp/" "/dev/shm" "chmod" "base64" "python -c" "perl -e" "|bash" "|sh")
-        local flagged=0
-        for pat in "${suspicious_patterns[@]}"; do
-            if echo -e "$all_crons" | grep -q "$pat"; then
-                flag "Crontab contains suspicious pattern: ${BOLD}${pat}${RESET}"
-                flagged=1
+        # High-risk patterns in cron commands
+        declare -A CRON_PATTERNS
+        CRON_PATTERNS["curl .* | bash"]="downloads and immediately executes remote code"
+        CRON_PATTERNS["wget .* | bash"]="downloads and immediately executes remote code"
+        CRON_PATTERNS["wget .* -O .* && bash"]="downloads a file then executes it"
+        CRON_PATTERNS["curl .* -o .* && bash"]="downloads a file then executes it"
+        CRON_PATTERNS["/tmp/"]="executes something from /tmp — common malware location"
+        CRON_PATTERNS["/dev/shm"]="executes something from /dev/shm — common malware location"
+        CRON_PATTERNS["base64 -d"]="decodes and possibly executes base64-encoded payload"
+        CRON_PATTERNS["\$(.*curl\|.*wget"]="command substitution downloading remote content"
+        CRON_PATTERNS["python.*-c"]="inline Python execution — can hide obfuscated commands"
+        CRON_PATTERNS["perl.*-e"]="inline Perl execution — can hide obfuscated commands"
+        CRON_PATTERNS["bash -i"]="interactive shell in cron — used to establish reverse shells"
+        CRON_PATTERNS["nc .*-e"]="netcat with -e flag — classic reverse shell"
+        CRON_PATTERNS["chmod.*777"]="making a file world-writable/executable"
+        CRON_PATTERNS["chmod.*\+x.*&&"]="making something executable then running it"
+
+        local clean=1
+        for pattern in "${!CRON_PATTERNS[@]}"; do
+            if echo "$all_crons" | grep -qiE "$pattern"; then
+                flag "Suspicious cron pattern: ${BOLD}${pattern}${RESET} (${CRON_PATTERNS[$pattern]})"
+                fix "Inspect and remove: crontab -e"
+                clean=0
             fi
         done
-        [ "$flagged" -eq 0 ] && ok "No obviously suspicious commands in crontabs." \
-            || info "Review the crontab entries above carefully."
+        [ "$clean" -eq 1 ] && ok "No high-risk patterns found in crontabs."
     fi
+
+    # Check system cron files for same patterns
+    local sys_cron
+    sys_cron=$(cat /etc/cron.d/* /etc/crontab 2>/dev/null || true)
+    if echo "$sys_cron" | grep -qE '/tmp/|/dev/shm|base64|curl.*\|.*sh|wget.*\|.*sh'; then
+        flag "Suspicious pattern found in system cron files (/etc/cron.d or /etc/crontab)."
+        fix "Review: cat /etc/crontab && ls -la /etc/cron.d/"
+    else
+        ok "No suspicious patterns in system cron files."
+    fi
+
     pause
 }
 
 check_startup_scripts() {
     header "Startup Scripts"
-    desc "Lists legacy SysV init scripts and their runlevel symlinks."
+    desc "Legacy SysV init scripts — another persistence location."
     run "ls -la /etc/init.d/"
     run "ls -la /etc/rc2.d/"
 
     analysis_header
-    local init_scripts
-    init_scripts=$(ls /etc/init.d/)
     local known=("acpid" "apparmor" "apport" "chrony" "console-setup.sh" "cron"
         "cryptdisks" "cryptdisks-early" "dbus" "grub-common" "hibagent"
         "irqbalance" "iscsid" "keyboard-setup.sh" "kmod" "nginx" "open-iscsi"
         "open-vm-tools" "plymouth" "plymouth-log" "procps" "rsync"
         "screen-cleanup" "ssh" "sysstat" "ufw" "unattended-upgrades" "uuidd")
-    local flagged=0
+
+    local unknown_scripts=()
     while IFS= read -r script; do
+        [ -z "$script" ] && continue
         local k=0
         for kn in "${known[@]}"; do [ "$script" = "$kn" ] && k=1 && break; done
-        [ "$k" -eq 0 ] && warn "Unfamiliar init.d script: ${BOLD}$script${RESET}" && flagged=1
-    done <<< "$init_scripts"
-    [ "$flagged" -eq 0 ] && ok "All init.d scripts match known Ubuntu defaults."
+        [ "$k" -eq 0 ] && unknown_scripts+=("$script")
+    done <<< "$(ls /etc/init.d/ 2>/dev/null)"
+
+    if [ "${#unknown_scripts[@]}" -eq 0 ]; then
+        ok "All init.d scripts match known Ubuntu defaults."
+    else
+        warn "${#unknown_scripts[@]} unfamiliar init.d script(s) — review these:"
+        for s in "${unknown_scripts[@]}"; do
+            warn "  ${BOLD}/etc/init.d/$s${RESET}"
+            fix "  Inspect: cat /etc/init.d/$s | head -30"
+        done
+    fi
+
     pause
 }
 
 check_shell_users() {
     header "Users With Shell Access"
-    desc "Lists accounts that can run interactive commands (bash/sh)."
+    desc "Accounts that can run interactive commands."
     local output
     output=$(grep -v '/nologin\|/false' /etc/passwd)
     echo "$output"
     echo
 
     analysis_header
-    local count
-    count=$(echo "$output" | grep -c '.' || true)
-    local non_system
-    non_system=$(echo "$output" | awk -F: '$3>=1000 && $1!="nobody" {print $1}')
-    local system_shell
-    system_shell=$(echo "$output" | awk -F: '$3<1000 && $3>0 && ($7=="/bin/bash" || $7=="/bin/sh") {print $1}')
 
-    info "$count account(s) with a shell (including system accounts like root, sync)."
-    if [ -n "$non_system" ]; then
-        ok "Human user account(s) with shell access (UID ≥ 1000):"
-        while IFS= read -r u; do info "  ${BOLD}$u${RESET}"; done <<< "$non_system"
+    # Human users (UID >= 1000)
+    local human_users
+    human_users=$(echo "$output" | awk -F: '$3>=1000 && $1!="nobody" {print $1, $3, $7}')
+    if [ -n "$human_users" ]; then
+        ok "Human account(s) with shell access (UID ≥ 1000):"
+        while IFS= read -r line; do
+            local user uid shell
+            user=$(echo "$line" | awk '{print $1}')
+            uid=$(echo "$line" | awk '{print $2}')
+            shell=$(echo "$line" | awk '{print $3}')
+            ok "  ${BOLD}$user${RESET} (UID $uid, shell: $shell)"
+            # Check if account has a password set (! or * = locked/no password)
+            local pw_status
+            pw_status=$(sudo passwd -S "$user" 2>/dev/null | awk '{print $2}')
+            case "$pw_status" in
+                P)  warn "  ↳ $user has a password set — SSH key-only login is more secure." ;;
+                NP) flag "  ↳ $user has NO PASSWORD — account can be accessed without credentials!"
+                    fix "  Lock or set a password: sudo passwd $user" ;;
+                L)  ok "  ↳ $user's password is locked (SSH key only — good)." ;;
+            esac
+        done <<< "$human_users"
     fi
-    if [ -n "$system_shell" ]; then
-        warn "System account(s) with a real shell (review these):"
-        while IFS= read -r u; do warn "  ${BOLD}$u${RESET}"; done <<< "$system_shell"
+
+    # System accounts with real shells (should have /bin/false or /usr/sbin/nologin)
+    local system_with_shell
+    system_with_shell=$(echo "$output" | awk -F: '$3>0 && $3<1000 && ($7=="/bin/bash" || $7=="/bin/sh") {print $1, $3}')
+    if [ -n "$system_with_shell" ]; then
+        flag "System account(s) with an interactive shell — these should use /usr/sbin/nologin:"
+        while IFS= read -r line; do
+            flag "  ${BOLD}$(echo "$line" | awk '{print $1}')${RESET} (UID $(echo "$line" | awk '{print $2}'))"
+            fix "  Fix: sudo usermod -s /usr/sbin/nologin $(echo "$line" | awk '{print $1}')"
+        done <<< "$system_with_shell"
     else
-        ok "No unexpected system accounts with interactive shell access."
+        ok "No system accounts have an interactive shell."
     fi
+
     pause
 }
 
 check_root_uid() {
     header "Users With UID 0 (root-level)"
-    desc "Only the 'root' account should have UID 0."
+    desc "Every account with UID 0 has full system control."
     local output
     output=$(awk -F: '$3==0' /etc/passwd)
     echo "$output"
@@ -718,94 +1075,137 @@ check_root_uid() {
 
     analysis_header
     local count
-    count=$(echo "$output" | grep -c '.' || true)
+    count=$(echo "$output" | grep -c '.' 2>/dev/null || echo 0)
+
     if [ "$count" -eq 1 ] && echo "$output" | grep -q '^root:'; then
         ok "Only 'root' has UID 0 — expected."
     elif [ "$count" -eq 0 ]; then
-        warn "No UID 0 account found — unusual, root may have been renamed."
+        warn "No UID 0 account found — root may have been renamed (unusual but not necessarily malicious)."
     else
-        flag "$count accounts with UID 0 detected! Only 'root' should have UID 0."
-        flag "Extra UID 0 accounts are a classic attacker backdoor — investigate immediately."
+        flag "$count accounts with UID 0 — only 'root' should have UID 0!"
+        flag "Extra UID 0 accounts are the oldest trick in the attacker handbook."
         echo "$output" | grep -v '^root:' | while IFS= read -r line; do
-            flag "  Suspicious: $line"
+            local extra_user
+            extra_user=$(echo "$line" | cut -d: -f1)
+            flag "  Backdoor account: ${BOLD}$extra_user${RESET} — delete immediately"
+            fix "  sudo userdel -r $extra_user"
         done
     fi
+
     pause
 }
 
 check_sudoers() {
     header "Sudoers Configuration"
-    desc "Shows who can run commands as root via sudo."
+    desc "Who can run what as root."
     run "sudo cat /etc/sudoers"
     echo -e "${GREEN}\$ sudo ls /etc/sudoers.d/${RESET}"
     sudo ls /etc/sudoers.d/ 2>/dev/null
     echo
 
     analysis_header
-    local sudoers_content
-    sudoers_content=$(sudo cat /etc/sudoers 2>/dev/null)
-    local nopasswd
-    nopasswd=$(echo "$sudoers_content" | grep 'NOPASSWD' | grep -v '^#' || true)
-    local all_all
-    all_all=$(echo "$sudoers_content" | grep 'ALL=(ALL' | grep -v '^#' || true)
+    local sudoers
+    sudoers=$(sudo cat /etc/sudoers 2>/dev/null)
+
+    # NOPASSWD — dangerous if applied broadly
+    local nopasswd_all
+    nopasswd_all=$(echo "$sudoers" | grep -v '^#' | grep 'NOPASSWD' | grep 'ALL' || true)
+    local nopasswd_limited
+    nopasswd_limited=$(echo "$sudoers" | grep -v '^#' | grep 'NOPASSWD' | grep -v 'ALL' || true)
+
+    if [ -n "$nopasswd_all" ]; then
+        flag "NOPASSWD ALL — these entries can run any command as root without a password:"
+        while IFS= read -r l; do flag "  $l"; done <<< "$nopasswd_all"
+        fix "Restrict to specific commands or require a password: remove NOPASSWD from /etc/sudoers"
+    elif [ -n "$nopasswd_limited" ]; then
+        warn "NOPASSWD entries for specific commands (lower risk, but review):"
+        while IFS= read -r l; do warn "  $l"; done <<< "$nopasswd_limited"
+    else
+        ok "No NOPASSWD entries — sudo always requires a password."
+    fi
+
+    # Wildcard commands — 'ALL' grants everything
+    local unrestricted
+    unrestricted=$(echo "$sudoers" | grep -v '^#' | grep 'ALL=(ALL.*) ALL' | grep -v 'NOPASSWD' || true)
+    [ -n "$unrestricted" ] && info "Full sudo access (with password) granted to:" \
+        && while IFS= read -r l; do info "  $l"; done <<< "$unrestricted"
+
+    # sudoers.d files — attackers sometimes drop files here
     local sudod_files
     sudod_files=$(sudo ls /etc/sudoers.d/ 2>/dev/null | grep -v README || true)
-
-    [ -n "$nopasswd" ] && warn "NOPASSWD entries found — these users can sudo without a password:" \
-        && while IFS= read -r l; do warn "  $l"; done <<< "$nopasswd" \
-        || ok "No NOPASSWD entries — sudo requires a password."
-
-    [ -n "$all_all" ] && info "Full sudo access entries (ALL=(ALL)):" \
-        && while IFS= read -r l; do info "  $l"; done <<< "$all_all"
-
     if [ -n "$sudod_files" ]; then
-        info "Files in /etc/sudoers.d/ (each grants additional sudo rules):"
-        while IFS= read -r f; do info "  $f"; done <<< "$sudod_files"
+        info "Additional sudoers rules in /etc/sudoers.d/:"
+        while IFS= read -r f; do
+            local content
+            content=$(sudo cat "/etc/sudoers.d/$f" 2>/dev/null | grep -v '^#' | grep -v '^$' || true)
+            info "  ${BOLD}$f${RESET}:"
+            [ -n "$content" ] && while IFS= read -r l; do info "    $l"; done <<< "$content"
+            # Flag if a sudoers.d file grants NOPASSWD ALL
+            echo "$content" | grep -q 'NOPASSWD.*ALL' \
+                && flag "  /etc/sudoers.d/$f grants NOPASSWD ALL — high risk!" \
+                && fix "  sudo rm /etc/sudoers.d/$f  (after verifying it's not needed)"
+        done <<< "$sudod_files"
     else
-        ok "No additional sudoers.d files."
+        ok "No additional files in /etc/sudoers.d/."
     fi
+
     pause
 }
 
 check_suid() {
     header "SUID Binaries"
-    desc "Finds executables with the setuid bit — they run as their owner (often root)."
+    desc "Executables that run as their owner (often root) regardless of who launches them."
     local output
     output=$(find / -perm -4000 -type f 2>/dev/null)
     echo "$output"
     echo
 
     analysis_header
-    local count
-    count=$(echo "$output" | grep -c '.' || true)
-    info "$count SUID binaries found."
 
-    # Known legitimate SUID binaries on Ubuntu
-    local known_suid=("sudo" "su" "passwd" "newgrp" "gpasswd" "chsh" "chfn"
-        "mount" "umount" "ping" "ping6" "traceroute6" "at" "crontab"
-        "pkexec" "fusermount" "fusermount3" "ssh-keysign" "Xorg"
-        "vmware-user-suid-wrapper" "unix_chkpwd" "pam_timestamp_check"
-        "newuidmap" "newgidmap" "snap" "ntfs-3g" "polkit")
-
-    local flagged=0
+    # Instead of a denylist, cross-reference against dpkg to see if each binary
+    # is owned by an installed package — unpackaged SUID binaries are suspicious
+    local unpackaged=()
+    local pkg_count=0
     while IFS= read -r path; do
         [ -z "$path" ] && continue
-        local base
-        base=$(basename "$path")
-        local known=0
-        for k in "${known_suid[@]}"; do [ "$base" = "$k" ] && known=1 && break; done
-        if [ "$known" -eq 0 ]; then
-            flag "Unexpected SUID binary: ${BOLD}$path${RESET}"
-            flagged=1
+        local pkg
+        pkg=$(dpkg -S "$path" 2>/dev/null | cut -d: -f1 || true)
+        if [ -z "$pkg" ]; then
+            unpackaged+=("$path")
+        else
+            pkg_count=$(( pkg_count + 1 ))
         fi
     done <<< "$output"
-    [ "$flagged" -eq 0 ] && ok "All SUID binaries are in the known-legitimate set."
+
+    ok "$pkg_count SUID binaries are owned by installed packages — expected."
+    if [ "${#unpackaged[@]}" -gt 0 ]; then
+        flag "${#unpackaged[@]} SUID binary/binaries NOT owned by any package — investigate:"
+        for f in "${unpackaged[@]}"; do
+            flag "  ${BOLD}$f${RESET}"
+            fix "  Check: ls -la $f && file $f && strings $f | head -20"
+            fix "  Remove SUID if not needed: sudo chmod u-s $f"
+        done
+    else
+        ok "All SUID binaries are owned by installed packages."
+    fi
+
+    # Specifically flag shells or interpreters with SUID — instant root escalation
+    local suid_shells
+    suid_shells=$(echo "$output" | grep -E '/(bash|sh|dash|zsh|python|perl|ruby|node|php)$' || true)
+    if [ -n "$suid_shells" ]; then
+        flag "SUID set on a shell or interpreter — this grants instant root to anyone who runs it!"
+        while IFS= read -r s; do
+            flag "  ${BOLD}$s${RESET}"
+            fix "  Remove immediately: sudo chmod u-s $s"
+        done <<< "$suid_shells"
+    fi
+
     pause
 }
 
 check_etc_modified() {
     header "Recently Modified /etc Files (last 7 days)"
-    desc "Config files changed after your initial setup date may have been tampered with."
+    desc "Config files changed since initial setup may have been tampered with."
     local output
     output=$(find /etc -mtime -7 -type f 2>/dev/null)
     echo "$output"
@@ -813,33 +1213,123 @@ check_etc_modified() {
 
     analysis_header
     local count
-    count=$(echo "$output" | grep -c '.' || true)
+    count=$(echo "$output" | grep -c '.' 2>/dev/null || echo 0)
     info "$count file(s) in /etc modified in the last 7 days."
 
-    # Flag high-sensitivity files
-    local sensitive=("/etc/passwd" "/etc/shadow" "/etc/sudoers" "/etc/ssh/sshd_config"
-        "/etc/crontab" "/etc/hosts" "/etc/ld.so.preload" "/etc/pam.d/sshd"
-        "/etc/pam.d/sudo" "/etc/profile" "/etc/bash.bashrc" "/etc/environment")
-    local flagged=0
-    for f in "${sensitive[@]}"; do
-        if echo "$output" | grep -q "^${f}$"; then
-            warn "Sensitive file was recently modified: ${BOLD}$f${RESET} — verify this change was intentional."
-            flagged=1
+    # ── Provisioning window filter ───────────────────────────────────────────
+    # Files modified within the first 10 minutes of system boot are almost
+    # certainly written by cloud-init or the OS installer, not by an attacker.
+    # We compare each file's mtime (seconds since epoch) against boot time
+    # and skip files that fall inside the provisioning window.
+    local boot_epoch
+    boot_epoch=$(date -d "$(uptime -s)" +%s 2>/dev/null \
+        || date -j -f "%Y-%m-%d %H:%M:%S" "$(uptime -s)" +%s 2>/dev/null \
+        || echo 0)
+    local provision_window=600   # 10 minutes after boot
+    local provision_cutoff=$(( boot_epoch + provision_window ))
+
+    # Files written by cloud-init regardless of timing
+    local cloud_init_files=(
+        "/etc/passwd" "/etc/shadow" "/etc/shadow-" "/etc/gshadow" "/etc/gshadow-"
+        "/etc/group" "/etc/subuid" "/etc/subgid" "/etc/hostname" "/etc/machine-id"
+        "/etc/ssh/ssh_host_rsa_key" "/etc/ssh/ssh_host_rsa_key.pub"
+        "/etc/ssh/ssh_host_ecdsa_key" "/etc/ssh/ssh_host_ecdsa_key.pub"
+        "/etc/ssh/ssh_host_ed25519_key" "/etc/ssh/ssh_host_ed25519_key.pub"
+        "/etc/netplan/50-cloud-init.yaml"
+        "/etc/apt/sources.list.d/ubuntu.sources"
+        "/etc/udev/rules.d/90-cloud-init-hook-hotplug.rules"
+        "/etc/ld.so.cache"
+    )
+    # PAM common-* files are written by pam packages on first boot
+    local cloud_init_patterns=("/etc/pam.d/common-" "/etc/ssh/ssh_host_")
+
+    _is_provisioning_write() {
+        local f="$1"
+        # Check explicit cloud-init file list
+        for ci in "${cloud_init_files[@]}"; do
+            [ "$f" = "$ci" ] && return 0
+        done
+        # Check pattern prefixes
+        for pat in "${cloud_init_patterns[@]}"; do
+            [[ "$f" == "$pat"* ]] && return 0
+        done
+        # Check if mtime falls within the boot provisioning window
+        if [ "$boot_epoch" -gt 0 ]; then
+            local mtime
+            mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+            [ "$mtime" -le "$provision_cutoff" ] && return 0
+        fi
+        return 1
+    }
+
+    # ── Show suppressed provisioning files as a collapsed note ───────────────
+    local suppressed=()
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        _is_provisioning_write "$f" && suppressed+=("$f")
+    done <<< "$output"
+
+    if [ "${#suppressed[@]}" -gt 0 ]; then
+        ok "${#suppressed[@]} file(s) modified during initial provisioning (cloud-init / first boot) — suppressed as expected:"
+        for f in "${suppressed[@]}"; do info "  $f"; done
+        echo
+    fi
+
+    # ── Tier 1 — critical files ───────────────────────────────────────────────
+    local tier1=("/etc/passwd" "/etc/shadow" "/etc/sudoers" "/etc/ssh/sshd_config"
+        "/etc/ld.so.preload" "/etc/pam.d/sshd" "/etc/pam.d/sudo"
+        "/etc/pam.d/common-auth" "/etc/profile" "/etc/bash.bashrc"
+        "/etc/environment" "/etc/crontab")
+
+    # ── Tier 2 — elevated concern files ──────────────────────────────────────
+    local tier2=("/etc/hosts" "/etc/resolv.conf" "/etc/nsswitch.conf"
+        "/etc/ssh/ssh_config" "/etc/sysctl.conf" "/etc/security/limits.conf"
+        "/etc/apt/sources.list")
+
+    local t1_hit=0 t2_hit=0
+    for f in "${tier1[@]}"; do
+        if echo "$output" | grep -qF "$f"; then
+            # Skip if this was a provisioning write
+            _is_provisioning_write "$f" && continue
+            if [ "$f" = "/etc/ld.so.preload" ]; then
+                flag "${BOLD}/etc/ld.so.preload${RESET} was modified — rootkits use this to inject malicious libraries at startup!"
+                fix "Inspect immediately: cat /etc/ld.so.preload — it should be empty on a clean system."
+            else
+                local mtime_human
+                mtime_human=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1 || echo "unknown time")
+                flag "Critical config modified post-provisioning: ${BOLD}$f${RESET} (at $mtime_human)"
+                fix "Show what changed: sudo diff <(dpkg-query -S $f 2>/dev/null) <(echo $f) || debsums -c"
+                fix "Check who modified it: sudo ausearch -f $f 2>/dev/null | tail -20"
+            fi
+            t1_hit=1
         fi
     done
 
-    # /etc/ld.so.preload is a classic rootkit trick
-    if echo "$output" | grep -q 'ld.so.preload'; then
-        flag "/etc/ld.so.preload was modified — this file is used by rootkits to inject malicious libraries!"
-    fi
+    for f in "${tier2[@]}"; do
+        if echo "$output" | grep -qF "$f"; then
+            _is_provisioning_write "$f" && continue
+            local mtime_human
+            mtime_human=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1 || echo "unknown time")
+            warn "Sensitive config modified post-provisioning: ${BOLD}$f${RESET} (at $mtime_human)"
+            t2_hit=1
+        fi
+    done
 
-    [ "$flagged" -eq 0 ] && ok "No high-sensitivity config files were recently modified."
+    [ "$t1_hit" -eq 0 ] && [ "$t2_hit" -eq 0 ] \
+        && ok "No critical or sensitive config files were modified after provisioning."
+
+    # Recent apt activity that could explain legitimate changes
+    local last_apt
+    last_apt=$(grep -E 'install|upgrade' /var/log/dpkg.log 2>/dev/null | tail -3 || true)
+    [ -n "$last_apt" ] && info "Recent apt activity (may explain some modifications):" \
+        && while IFS= read -r l; do info "  $l"; done <<< "$last_apt"
+
     pause
 }
 
 check_bin_modified() {
     header "Recently Modified System Binaries (last 30 days)"
-    desc "Rootkits replace system binaries with versions that hide attacker activity."
+    desc "Rootkits replace core binaries like ps, ls, and netstat to hide their activity."
     local output
     output=$(find /usr/bin /usr/sbin /bin /sbin -mtime -30 -type f 2>/dev/null)
     echo "$output"
@@ -847,38 +1337,67 @@ check_bin_modified() {
 
     analysis_header
     local count
-    count=$(echo "$output" | grep -c '.' || true)
+    count=$(echo "$output" | grep -c '.' 2>/dev/null || echo 0)
 
     if [ "$count" -eq 0 ]; then
         ok "No system binaries modified in the last 30 days."
-    else
-        info "$count binary/binaries modified in the last 30 days."
-        # If there were recent apt upgrades this is expected — check dpkg log
-        local apt_upgrades
-        apt_upgrades=$(grep 'upgrade\|install' /var/log/dpkg.log 2>/dev/null | tail -5)
-        if [ -n "$apt_upgrades" ]; then
-            ok "Recent apt activity found — binary changes are likely from package upgrades."
-            info "Last apt operations:"
-            while IFS= read -r line; do info "  $line"; done <<< "$apt_upgrades"
-        else
-            warn "No recent apt activity found but binaries were modified — investigate manually."
-            flag "Check each binary with: dpkg -S <binary_path> to confirm it belongs to a package."
-        fi
-        # Flag specific high-risk binaries if modified
-        local risky=("ps" "ls" "netstat" "ss" "top" "find" "who" "w" "last" "login" "sshd" "cron")
-        while IFS= read -r f; do
-            local base; base=$(basename "$f")
-            for r in "${risky[@]}"; do
-                [ "$base" = "$r" ] && flag "High-risk binary modified: ${BOLD}$f${RESET} — rootkits commonly replace this." && break
-            done
-        done <<< "$output"
+        pause
+        return
     fi
+
+    info "$count binary/binaries modified in the last 30 days."
+
+    # Cross-reference with dpkg log to distinguish upgrades from tampering
+    local apt_dates
+    apt_dates=$(grep -E 'upgrade|install' /var/log/dpkg.log 2>/dev/null | awk '{print $1}' | sort -u | tail -10)
+    if [ -n "$apt_dates" ]; then
+        ok "Recent package activity found — most binary changes are likely legitimate upgrades."
+        info "Dates of recent apt operations: $(echo "$apt_dates" | tr '\n' ' ')"
+    else
+        warn "No recent apt/dpkg activity found but binaries were modified."
+        fix "For every binary listed above, run: dpkg -S <path> to verify it belongs to a package"
+        fix "Then verify the hash: debsums <package-name>"
+    fi
+
+    # High-risk binaries — the ones rootkits always replace
+    local tier1_bins=("ps" "ls" "top" "netstat" "ss" "find" "who" "w" "last"
+        "login" "sshd" "cron" "bash" "sh" "awk" "grep" "sed" "cat")
+    local tier1_hit=0
+    while IFS= read -r f; do
+        local base; base=$(basename "$f")
+        for r in "${tier1_bins[@]}"; do
+            if [ "$base" = "$r" ]; then
+                flag "High-value binary modified: ${BOLD}$f${RESET} — rootkits routinely replace this."
+                fix "Verify hash: dpkg -S $f && debsums $(dpkg -S $f 2>/dev/null | cut -d: -f1)"
+                tier1_hit=1
+                break
+            fi
+        done
+    done <<< "$output"
+    [ "$tier1_hit" -eq 0 ] && ok "None of the highest-risk binaries (ps, ls, ss, sshd etc.) were modified."
+
+    # Check debsums if available
+    if command -v debsums &>/dev/null; then
+        info "Running debsums integrity check on modified binaries..."
+        local debsums_fail
+        debsums_fail=$(sudo debsums -c 2>/dev/null | grep -v 'OK$' || true)
+        if [ -n "$debsums_fail" ]; then
+            flag "debsums found hash mismatches — these files differ from their package versions:"
+            while IFS= read -r l; do flag "  $l"; done <<< "$debsums_fail"
+            fix "Reinstall affected packages: sudo apt install --reinstall <package>"
+        else
+            ok "debsums: all checked binaries match their package hashes."
+        fi
+    else
+        fix "Install debsums for hash verification: sudo apt install debsums && sudo debsums -c"
+    fi
+
     pause
 }
 
 check_tmp_hidden() {
     header "Hidden Files in /tmp and /var/tmp"
-    desc "/tmp and /var/tmp are world-writable drop zones for malware."
+    desc "/tmp and /dev/shm are world-writable — favourite malware staging areas."
     local hidden
     hidden=$(find /tmp /var/tmp /dev/shm -name '.*' 2>/dev/null)
     echo -e "${GREEN}\$ find /tmp /var/tmp /dev/shm -name '.*' 2>/dev/null${RESET}"
@@ -887,26 +1406,46 @@ check_tmp_hidden() {
     run "ls -la /tmp /var/tmp"
 
     analysis_header
+
     if [ -z "$hidden" ]; then
-        ok "No hidden files in /tmp, /var/tmp, or /dev/shm — clean."
+        ok "No hidden dot-files in /tmp, /var/tmp, or /dev/shm."
     else
-        flag "Hidden files found:"
+        flag "Hidden file(s) found:"
         while IFS= read -r f; do
             flag "  ${BOLD}$f${RESET}"
-            # Check if executable
-            [ -x "$f" ] && flag "  ^^^ This file is EXECUTABLE — high suspicion of malware."
+            [ -x "$f" ] && flag "  ↳ EXECUTABLE — strongly suspicious of malware." \
+                && fix "  Investigate before deleting: file $f && strings $f | head -20"
         done <<< "$hidden"
     fi
 
-    # Check for executable files in /tmp regardless of hidden status
+    # Any executable (not a .sh script) sitting in /tmp
     local exec_tmp
-    exec_tmp=$(find /tmp /var/tmp /dev/shm -type f -perm /111 2>/dev/null | grep -v '\.sh$' || true)
+    exec_tmp=$(find /tmp /var/tmp /dev/shm -type f -perm /111 2>/dev/null \
+        | grep -vE '\.(sh|py|rb|pl)$' || true)
     if [ -n "$exec_tmp" ]; then
-        flag "Executable binaries found in /tmp or /dev/shm (common malware location):"
-        while IFS= read -r f; do flag "  ${BOLD}$f${RESET}"; done <<< "$exec_tmp"
+        flag "Executable binary/binaries in /tmp or /dev/shm — malware almost always lives here:"
+        while IFS= read -r f; do
+            flag "  ${BOLD}$f${RESET}"
+            fix "  Identify: file $f && ls -la $f"
+            fix "  If malicious: sudo rm -f $f"
+        done <<< "$exec_tmp"
     else
-        ok "No unexpected executable binaries in /tmp or /dev/shm."
+        ok "No unexplained executable binaries in /tmp or /dev/shm."
     fi
+
+    # Files larger than 1MB in /tmp (dropped payloads are often large)
+    local large_files
+    large_files=$(find /tmp /var/tmp /dev/shm -type f -size +1M 2>/dev/null || true)
+    if [ -n "$large_files" ]; then
+        warn "Large file(s) (>1MB) in /tmp — could be downloaded payloads:"
+        while IFS= read -r f; do
+            local size
+            size=$(du -sh "$f" 2>/dev/null | awk '{print $1}')
+            warn "  ${BOLD}$f${RESET} ($size)"
+            fix "  Inspect: file $f && ls -la $f"
+        done <<< "$large_files"
+    fi
+
     pause
 }
 
@@ -923,18 +1462,26 @@ check_rkhunter() {
 
     analysis_header
     local warnings infections
-    warnings=$(echo "$output" | grep -c 'Warning' || true)
-    infections=$(echo "$output" | grep -c 'Infected' || true)
-    [ "$infections" -gt 0 ] && flag "$infections infection(s) found by rkhunter — investigate immediately!" \
+    warnings=$(echo "$output" | grep -c 'Warning' 2>/dev/null || echo 0)
+    infections=$(echo "$output" | grep -c 'Infected' 2>/dev/null || echo 0)
+
+    [ "$infections" -gt 0 ] && flag "$infections infection(s) found — treat this as a compromise until proven otherwise." \
+        && fix "Full incident response: take a snapshot now, then investigate each finding." \
         || ok "No infections detected by rkhunter."
-    [ "$warnings" -gt 0 ] && warn "$warnings warning(s) from rkhunter — review output above." \
-        || ok "No warnings from rkhunter."
+
+    if [ "$warnings" -gt 0 ]; then
+        warn "$warnings warning(s) — rkhunter warnings are often false positives but must be checked:"
+        echo "$output" | grep 'Warning' | while IFS= read -r l; do warn "  $l"; done
+        fix "Investigate each warning: sudo rkhunter --check --sk --rwo (warnings only)"
+    else
+        ok "No warnings from rkhunter."
+    fi
     pause
 }
 
 check_chkrootkit() {
     header "chkrootkit"
-    desc "A second rootkit scanner with different detection signatures."
+    desc "Second rootkit scanner with different detection signatures — use both."
     sudo apt install chkrootkit -y -q
     local output
     output=$(sudo chkrootkit 2>&1)
@@ -944,9 +1491,22 @@ check_chkrootkit() {
     analysis_header
     local infected
     infected=$(echo "$output" | grep 'INFECTED' || true)
-    [ -n "$infected" ] && flag "chkrootkit found INFECTED entries:" \
-        && while IFS= read -r l; do flag "  $l"; done <<< "$infected" \
-        || ok "chkrootkit found no infections."
+    if [ -n "$infected" ]; then
+        flag "chkrootkit found INFECTED entries:"
+        while IFS= read -r l; do
+            flag "  $l"
+            fix "  Cross-reference with rkhunter — if both agree, treat as confirmed compromise."
+        done <<< "$infected"
+    else
+        ok "chkrootkit found no infections."
+    fi
+
+    # Some false positives to contextualise
+    local suspicious
+    suspicious=$(echo "$output" | grep -iE 'suspicious|warning' | grep -v 'not found' || true)
+    [ -n "$suspicious" ] && warn "chkrootkit warnings (may be false positives — verify):" \
+        && while IFS= read -r l; do warn "  $l"; done <<< "$suspicious"
+
     pause
 }
 
@@ -961,54 +1521,115 @@ check_clamav() {
     echo
 
     analysis_header
-    local infected
+    local infected scanned errors
     infected=$(echo "$output" | grep 'Infected files:' | awk '{print $3}')
-    [ "$infected" = "0" ] || [ -z "$infected" ] \
-        && ok "ClamAV found no infected files." \
-        || flag "ClamAV found ${BOLD}$infected${RESET} infected file(s) — check output above for details."
+    scanned=$(echo "$output" | grep 'Scanned files:' | awk '{print $3}')
+    errors=$(echo "$output" | grep 'Errors:' | awk '{print $2}')
+
+    info "Files scanned: ${scanned:-unknown}"
+    if [ "$infected" = "0" ] || [ -z "$infected" ]; then
+        ok "ClamAV found no infected files."
+    else
+        flag "ClamAV found ${BOLD}$infected${RESET} infected file(s) — they have been removed automatically."
+        fix "Check what was removed: grep 'FOUND' above, then audit how those files got there."
+        fix "Consider isolating the server: sudo ufw default deny outgoing && sudo ufw reload"
+    fi
+    [ -n "$errors" ] && [ "$errors" != "0" ] && warn "$errors scan error(s) — some files may not have been checked."
+
     pause
 }
 
 check_miners() {
     header "Crypto Miner Detection"
-    desc "Looks for known miner process names, binaries, and network connections."
+    desc "Targeted scan for miner processes, binaries, and network connections."
     echo -e "${GREEN}\$ ps aux --sort=-%cpu | head -20${RESET}"
     local ps_out
     ps_out=$(ps aux --sort=-%cpu | head -20)
     echo "$ps_out"
     echo
-    desc "Scanning for known miner binary names..."
+
+    desc "Scanning filesystem for known miner binaries..."
     local find_out
-    find_out=$(find / -name 'xmrig' -o -name 'minerd' -o -name 'kdevtmpfsi' -o -name 'kthreaddi' -o -name 'sysupdate' 2>/dev/null)
+    find_out=$(find / \( -name 'xmrig' -o -name 'minerd' -o -name 'kdevtmpfsi' \
+        -o -name 'kthreaddi' -o -name 'sysupdate' -o -name 'networkservice' \
+        -o -name 'cryptonight' -o -name 'cpuminer' \) 2>/dev/null)
     [ -n "$find_out" ] && echo "$find_out" || echo "(none found)"
     echo
-    desc "Checking for miner pool ports..."
+
+    desc "Checking for connections to known mining pool ports..."
     local net_out
-    net_out=$(ss -tupn | grep -E ':3333|:4444|:14444|:45700|:5555' || true)
+    net_out=$(ss -tupn | grep -E ':3333[^0-9]|:4444[^0-9]|:14444[^0-9]|:45700[^0-9]|:5555[^0-9]|:7777[^0-9]|:3032[^0-9]' || true)
     [ -n "$net_out" ] && echo "$net_out" || echo "(none found)"
     echo
 
     analysis_header
     local flagged=0
-    local miner_names=("xmrig" "minerd" "kdevtmpfsi" "kthreaddi" "sysupdate" "cryptonight" "kdevtmpfs ")
-    for name in "${miner_names[@]}"; do
-        echo "$ps_out" | grep -v grep | grep -q "$name" \
-            && flag "Miner process name ${BOLD}$name${RESET} found in process list!" && flagged=1
-    done
-    [ -n "$find_out" ] && flag "Miner binary found on disk: $find_out" && flagged=1
-    [ -n "$net_out" ] && flag "Active connection on a known mining pool port!" && flagged=1
 
-    # Check CPU — miners always spike it
-    local top_cpu
-    top_cpu=$(echo "$ps_out" | awk 'NR>1 && $3>80 {print $1, $3"% CPU", $11}')
-    [ -n "$top_cpu" ] && warn "Process(es) using >80% CPU — miners will always appear here:" \
-        && while IFS= read -r l; do warn "  $l"; done <<< "$top_cpu"
+    # Process name check
+    local miner_names=("xmrig" "minerd" "kdevtmpfsi" "kthreaddi" "sysupdate"
+        "cryptonight" "cpuminer" "ccminer" "bfgminer" "cgminer"
+        "ethminer" "claymore" "phoenixminer" "lolminer" "nbminer")
+    for name in "${miner_names[@]}"; do
+        local match
+        match=$(echo "$ps_out" | grep -v 'grep\|server_audit' | grep -i "$name" || true)
+        if [ -n "$match" ]; then
+            flag "Miner process ${BOLD}$name${RESET} is running!"
+            fix "Kill: sudo pkill -9 -f $name"
+            fix "Find and delete binary: sudo find / -name '$name' -delete 2>/dev/null"
+            flagged=1
+        fi
+    done
+
+    # Binary on disk
+    if [ -n "$find_out" ]; then
+        flag "Miner binary found on disk:"
+        while IFS= read -r f; do
+            flag "  ${BOLD}$f${RESET}"
+            fix "  Delete: sudo rm -f $f"
+        done <<< "$find_out"
+        flagged=1
+    fi
+
+    # Mining pool connections
+    if [ -n "$net_out" ]; then
+        flag "Active connection to a known mining pool port!"
+        echo "$net_out"
+        fix "Find owning process: sudo ss -tulpn | grep <port>, then: sudo kill -9 <PID>"
+        flagged=1
+    fi
+
+    # CPU spike — miners always consume maximum CPU
+    local cpu_hogs
+    cpu_hogs=$(echo "$ps_out" | awk 'NR>1 && $3>80 && $11!~/^\[/ {print $1, $3"%", $11}')
+    if [ -n "$cpu_hogs" ]; then
+        warn "Process(es) using >80% CPU — miners maximise CPU by design:"
+        while IFS= read -r l; do
+            warn "  $l"
+            local proc_name
+            proc_name=$(echo "$l" | awk '{print $NF}')
+            fix "  Investigate: sudo lsof -p $(pgrep -f "$proc_name" | head -1) 2>/dev/null | head -20"
+        done <<< "$cpu_hogs"
+    fi
+
+    # Check /proc for deleted executables (fileless miners)
+    local deleted
+    deleted=$(ls -la /proc/*/exe 2>/dev/null | grep deleted | awk '{print $NF}' | sed 's/ (deleted)//' || true)
+    if [ -n "$deleted" ]; then
+        flag "Process(es) with deleted executables — sign of fileless malware (common miner technique):"
+        while IFS= read -r d; do flag "  $d"; done <<< "$deleted"
+        fix "Reboot to clear fileless malware from memory, then audit startup scripts immediately."
+    fi
 
     [ "$flagged" -eq 0 ] && ok "No crypto miner indicators detected — clean."
+
     pause
 }
 
+# ─── Run all with risk summary ────────────────
+
 run_all() {
+    RISK_FLAGS=0; RISK_WARNS=0
+
     check_active_sessions;    check_login_history;     check_failed_logins
     check_accepted_logins;    check_ssh_keys;          check_ssh_config
     check_processes;          check_ports;             check_outbound
@@ -1016,7 +1637,31 @@ run_all() {
     check_startup_scripts;    check_shell_users;       check_root_uid
     check_sudoers;            check_suid;              check_etc_modified
     check_bin_modified;       check_tmp_hidden;        check_miners
-    echo -e "${GREEN}${BOLD}All checks complete. Run scanner options separately to install malware scanners.${RESET}"
+
+    clear
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${CYAN}  Full Audit Complete — Risk Summary${RESET}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${RESET}\n"
+
+    if [ "$RISK_FLAGS" -eq 0 ] && [ "$RISK_WARNS" -eq 0 ]; then
+        echo -e "  ${GREEN}${BOLD}✓ No issues found. Server appears clean.${RESET}\n"
+    else
+        [ "$RISK_FLAGS" -gt 0 ] && echo -e "  ${RED}${BOLD}[!] $RISK_FLAGS critical finding(s) require immediate attention.${RESET}"
+        [ "$RISK_WARNS" -gt 0 ] && echo -e "  ${AMBER}${BOLD}[~] $RISK_WARNS warning(s) should be reviewed.${RESET}"
+        echo
+
+        if [ "$RISK_FLAGS" -gt 5 ]; then
+            echo -e "  ${RED}${BOLD}High risk — consider this server potentially compromised.${RESET}"
+            echo -e "  ${RED}Take a snapshot before making changes, and review all [!] findings above.${RESET}"
+        elif [ "$RISK_FLAGS" -gt 0 ]; then
+            echo -e "  ${AMBER}Moderate risk — address all [!] items before this server handles sensitive data.${RESET}"
+        else
+            echo -e "  ${GREEN}Low risk — no critical findings, but review the [~] warnings above.${RESET}"
+        fi
+    fi
+
+    echo -e "\n  ${DIM}Run individual checks above to see findings and remediation steps.${RESET}"
+    echo -e "  ${DIM}Run options 21–23 to install and run malware scanners.${RESET}\n"
     pause
 }
 

@@ -6,22 +6,25 @@ An interactive terminal tool for auditing the security of an Ubuntu server. It r
 
 ## Installation
 
-Upload the script and its supporting files to your server, keeping the folder structure intact:
-
-```
-server_audit.sh
-audit/
-  lib.sh
-  menu.sh
-  checks_auth.sh
-  checks_system.sh
-  checks_malware.sh
-```
-
-Then make the entry point executable:
+Clone the repository directly onto your server:
 
 ```bash
+git clone https://github.com/Amplify-Maverick/ubuntu-security-audit.git
+cd ubuntu-security-audit
 chmod +x server_audit.sh
+```
+
+If `git` isn't installed:
+
+```bash
+sudo apt install git -y
+```
+
+To update to the latest version later:
+
+```bash
+cd ubuntu-security-audit
+git pull
 ```
 
 ---

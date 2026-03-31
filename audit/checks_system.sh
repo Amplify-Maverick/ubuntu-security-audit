@@ -169,6 +169,157 @@ check_outbound() {
     pause
 }
 
+check_firewall() {
+    header "Firewall (UFW)"
+    desc "Audits UFW status, default policies, active rules, and cross-references open ports."
+
+    # ── Raw output ────────────────────────────────────────────────────────────
+    echo -e "${GREEN}\$ sudo ufw status verbose${RESET}"
+    local ufw_output
+    ufw_output=$(sudo ufw status verbose 2>/dev/null)
+    echo "$ufw_output"
+    echo
+
+    analysis_header
+
+    # ── UFW installed? ────────────────────────────────────────────────────────
+    if ! command -v ufw &>/dev/null; then
+        flag "UFW is not installed — no firewall is protecting this server."
+        fix "Install and enable: sudo apt install ufw -y && sudo ufw default deny incoming && sudo ufw allow 22 && sudo ufw enable"
+        pause; return
+    fi
+
+    # ── UFW active? ───────────────────────────────────────────────────────────
+    local status
+    status=$(sudo ufw status 2>/dev/null | head -1)
+    if echo "$status" | grep -qi "inactive"; then
+        flag "UFW is installed but ${BOLD}inactive${RESET} — the firewall is off and all ports are unprotected."
+        fix "Enable UFW: sudo ufw enable"
+        fix "Before enabling, ensure port 22 is allowed: sudo ufw allow 22"
+        pause; return
+    fi
+    ok "UFW is active."
+
+    # ── Default policies ──────────────────────────────────────────────────────
+    local default_in default_out default_fwd
+    default_in=$(echo  "$ufw_output" | grep -i 'default.*incoming' | grep -oiE 'deny|allow|reject' | head -1)
+    default_out=$(echo "$ufw_output" | grep -i 'default.*outgoing' | grep -oiE 'deny|allow|reject' | head -1)
+    default_fwd=$(echo "$ufw_output" | grep -i 'default.*forward'  | grep -oiE 'deny|allow|reject' | head -1)
+
+    case "${default_in,,}" in
+        deny|reject) ok "Default incoming policy: ${BOLD}${default_in}${RESET} — only explicitly allowed ports are reachable." ;;
+        allow)       flag "Default incoming policy: ${BOLD}ALLOW${RESET} — all ports are open unless explicitly blocked."
+                     fix "Set a safe default: sudo ufw default deny incoming" ;;
+        *)           warn "Could not determine default incoming policy — verify manually: sudo ufw status verbose" ;;
+    esac
+
+    case "${default_out,,}" in
+        allow)       ok "Default outgoing policy: ${BOLD}ALLOW${RESET} — normal for most servers." ;;
+        deny|reject) warn "Default outgoing policy: ${BOLD}${default_out}${RESET} — legitimate services may be blocked."
+                     info "Ensure DNS (53), HTTP (80), HTTPS (443), and NTP (123) are explicitly allowed out." ;;
+        *)           info "Default outgoing policy: ${default_out:-unknown}" ;;
+    esac
+
+    [ -n "$default_fwd" ] && info "Default forwarding policy: ${BOLD}$default_fwd${RESET}"
+
+    # ── Parse active rules ────────────────────────────────────────────────────
+    local rules
+    rules=$(sudo ufw status numbered 2>/dev/null | grep '^\[')
+
+    if [ -z "$rules" ]; then
+        warn "No UFW rules defined — UFW is active but allowing nothing in by default."
+        fix "At minimum allow SSH: sudo ufw allow 22/tcp"
+        pause; return
+    fi
+
+    # ── SSH rule check — must exist or you risk lockout ──────────────────────
+    local ssh_port
+    ssh_port=$(sudo sshd -T 2>/dev/null | grep '^port ' | awk '{print $2}')
+    ssh_port="${ssh_port:-22}"
+
+    local ssh_rule_found=0
+    echo "$rules" | grep -qE "(${ssh_port}[^0-9]|OpenSSH|ssh)" && ssh_rule_found=1
+    if [ "$ssh_rule_found" -eq 0 ]; then
+        flag "No UFW rule found for SSH (port ${ssh_port}) — you may be locked out after a reconnect."
+        fix "Add rule immediately: sudo ufw allow ${ssh_port}/tcp"
+    else
+        ok "SSH (port ${ssh_port}) has an allow rule — remote access is protected."
+    fi
+
+    # ── Overly permissive rules ───────────────────────────────────────────────
+    # Rules allowing ANY source on sensitive ports
+    local any_rules
+    any_rules=$(echo "$rules" | grep -v '^\[.*\].*Anywhere.*DENY\|REJECT'         | grep -E 'ALLOW\s+Anywhere|ALLOW IN\s+Anywhere' || true)
+
+    local dangerous_ports=(21 23 25 53 110 135 139 143 445 1433 1521 2375 2376 3306 3389 5432 5900 6379 8080 27017)
+    local found_dangerous=0
+    while IFS= read -r rule; do
+        [ -z "$rule" ] && continue
+        for p in "${dangerous_ports[@]}"; do
+            if echo "$rule" | grep -qE "(^|[^0-9])${p}([^0-9]|$)"; then
+                flag "Port ${BOLD}$p${RESET} is allowed from ${BOLD}Anywhere${RESET} — this is a high-risk service port."
+                echo "  $rule"
+                fix "  Restrict to a specific IP: sudo ufw delete <rule_number> && sudo ufw allow from <your-ip> to any port $p"
+                found_dangerous=1
+            fi
+        done
+    done <<< "$any_rules"
+    [ "$found_dangerous" -eq 0 ] && ok "No high-risk service ports are open to the world."
+
+    # ── Rules allowing all traffic from Anywhere (no port restriction) ────────
+    local wildcard_rules
+    wildcard_rules=$(echo "$rules" | grep -E 'ALLOW\s+Anywhere$|ALLOW IN\s+Anywhere$'         | grep -v '/\|port\|[0-9]' || true)
+    if [ -n "$wildcard_rules" ]; then
+        flag "Rule(s) allowing ALL traffic from Anywhere — no port restriction:"
+        while IFS= read -r r; do flag "  $r"; done <<< "$wildcard_rules"
+        fix "Replace with specific port rules and delete the wildcard: sudo ufw status numbered, then sudo ufw delete <n>"
+    fi
+
+    # ── IPv6 rules ────────────────────────────────────────────────────────────
+    local ipv6_rules; ipv6_rules=$(echo "$rules" | grep -c 'v6' || echo 0)
+    local ipv4_rules; ipv4_rules=$(echo "$rules" | grep -cv 'v6' || echo 0)
+    if [ "$ipv6_rules" -gt 0 ]; then
+        ok "IPv6 rules present ($ipv6_rules rule(s)) — both IPv4 and IPv6 are covered."
+    else
+        warn "No IPv6 rules found — if IPv6 is enabled on this server, it may be unfiltered."
+        fix "Check: ip -6 addr show. If IPv6 is active, mirror your IPv4 rules for IPv6."
+    fi
+
+    # ── Cross-reference: open ports vs firewall rules ─────────────────────────
+    info "Cross-referencing listening ports against firewall rules..."
+    local listening_ports
+    listening_ports=$(ss -tulpn 2>/dev/null         | grep -E '0\.0\.0\.0:|:::' | grep LISTEN         | grep -oE ':[0-9]+\s' | tr -d ': ' | sort -un)
+
+    local unprotected=0
+    while IFS= read -r port; do
+        [ -z "$port" ] && continue
+        # Check if this port has a UFW allow rule
+        local covered=0
+        echo "$rules" | grep -qE "(^|[^0-9])${port}([^0-9]|$|/)" && covered=1
+        # Also consider it covered if default incoming is deny (all not-allowed = blocked)
+        [ "${default_in,,}" = "deny" ] || [ "${default_in,,}" = "reject" ] && covered=1
+
+        if [ "$covered" -eq 0 ] && [ "${default_in,,}" = "allow" ]; then
+            warn "Port ${BOLD}$port${RESET} is listening publicly but has no explicit UFW rule."
+            fix "  Add a rule or block it: sudo ufw allow $port  or  sudo ufw deny $port"
+            unprotected=$(( unprotected + 1 ))
+        fi
+    done <<< "$listening_ports"
+    [ "$unprotected" -eq 0 ] && ok "All publicly listening ports are accounted for by the firewall policy."
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    local logging
+    logging=$(echo "$ufw_output" | grep -i 'logging' | head -1 || true)
+    if echo "$logging" | grep -qi 'off\|disabled'; then
+        warn "UFW logging is off — blocked connection attempts are not being recorded."
+        fix "Enable logging: sudo ufw logging on"
+    elif [ -n "$logging" ]; then
+        ok "UFW logging is enabled: $logging"
+    fi
+
+    pause
+}
+
 check_enabled_services() {
     header "Enabled Systemd Services"
     desc "Services configured to start automatically at boot."

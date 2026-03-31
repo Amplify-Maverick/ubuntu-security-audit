@@ -32,6 +32,7 @@ SUBMENU_NETWORK=(
     "All running processes"
     "Listening ports"
     "Established outbound connections"
+    "Firewall (UFW)"
     "Run all Processes & Network checks"
     "← Back"
 )
@@ -245,8 +246,9 @@ submenu_dispatch() {
         "All running processes")                        check_processes ;;
         "Listening ports")                              check_ports ;;
         "Established outbound connections")             check_outbound ;;
+        "Firewall (UFW)")                                check_firewall ;;
         "Run all Processes & Network checks")
-            check_processes; check_ports; check_outbound ;;
+            check_processes; check_ports; check_outbound; check_firewall ;;
         # Persistence & Startup
         "Enabled systemd services")                     check_enabled_services ;;
         "Currently running services")                   check_running_services ;;

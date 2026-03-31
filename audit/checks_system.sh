@@ -601,17 +601,46 @@ check_suid() {
 
     analysis_header
 
-    # Cross-reference against dpkg — unpackaged SUID binaries are suspicious
+    # Cross-reference against dpkg — unpackaged SUID binaries are suspicious.
+    # Snap binaries (/snap/*) are managed outside dpkg entirely — skip them.
+    #
+    # dpkg -S path lookup has two subtleties on Ubuntu 22.04+:
+    #   1. The binary may be a symlink — resolve it with readlink first.
+    #   2. dpkg recorded paths under /bin but the canonical path is /usr/bin
+    #      (because /bin -> /usr/bin). Try the /usr-stripped path as a fallback.
+    #
+    # We use a helper that tries each candidate and returns on the first hit,
+    # because chaining with || loses the exit code once cut(1) is in the pipe.
+    _dpkg_owner() {
+        local p
+        for p in "$@"; do
+            local result; result=$(dpkg -S "$p" 2>/dev/null | cut -d: -f1)
+            [ -n "$result" ] && echo "$result" && return 0
+        done
+        return 1
+    }
+
     spinner_start "Verifying SUID binaries against installed packages..."
-    local unpackaged=() pkg_count=0
+    local unpackaged=() pkg_count=0 snap_count=0
     while IFS= read -r path; do
         [ -z "$path" ] && continue
-        local pkg; pkg=$(dpkg -S "$path" 2>/dev/null | cut -d: -f1 || true)
+
+        # Skip snap — managed by snapd, invisible to dpkg
+        if [[ "$path" == /snap/* ]]; then
+            (( snap_count++ ))
+            continue
+        fi
+
+        local real_path; real_path=$(readlink -f "$path" 2>/dev/null || echo "$path")
+        local alt_path; alt_path=$(echo "$path" | sed 's|^/usr/|/|')
+
+        local pkg; pkg=$(_dpkg_owner "$path" "$real_path" "$alt_path" || true)
         [ -z "$pkg" ] && unpackaged+=("$path") || pkg_count=$(( pkg_count + 1 ))
     done <<< "$output"
 
     spinner_stop
     ok "$pkg_count SUID binaries owned by installed packages — expected."
+    [ "$snap_count" -gt 0 ] && ok "$snap_count SUID binaries inside /snap — managed by snapd, not dpkg. Skipped."
     if [ "${#unpackaged[@]}" -gt 0 ]; then
         flag "${#unpackaged[@]} SUID binary/binaries NOT owned by any package:"
         for f in "${unpackaged[@]}"; do
@@ -620,7 +649,7 @@ check_suid() {
             fix "  Remove SUID if not needed: sudo chmod u-s $f"
         done
     else
-        ok "All SUID binaries are owned by installed packages."
+        ok "All non-snap SUID binaries are owned by installed packages."
     fi
 
     # Shells or interpreters with SUID — instant root escalation

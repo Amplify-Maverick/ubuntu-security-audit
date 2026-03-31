@@ -594,12 +594,15 @@ check_sudoers() {
 check_suid() {
     header "SUID Binaries"
     desc "Executables that run as their owner (often root) regardless of who launches them."
+    spinner_start "Scanning filesystem for SUID binaries..."
     local output; output=$(find / -perm -4000 -type f 2>/dev/null)
+    spinner_stop
     echo "$output"; echo
 
     analysis_header
 
     # Cross-reference against dpkg — unpackaged SUID binaries are suspicious
+    spinner_start "Verifying SUID binaries against installed packages..."
     local unpackaged=() pkg_count=0
     while IFS= read -r path; do
         [ -z "$path" ] && continue
@@ -607,6 +610,7 @@ check_suid() {
         [ -z "$pkg" ] && unpackaged+=("$path") || pkg_count=$(( pkg_count + 1 ))
     done <<< "$output"
 
+    spinner_stop
     ok "$pkg_count SUID binaries owned by installed packages — expected."
     if [ "${#unpackaged[@]}" -gt 0 ]; then
         flag "${#unpackaged[@]} SUID binary/binaries NOT owned by any package:"
@@ -635,7 +639,9 @@ check_suid() {
 check_etc_modified() {
     header "Recently Modified /etc Files (last 7 days)"
     desc "Config files changed since initial setup may have been tampered with."
+    spinner_start "Scanning /etc for recently modified files..."
     local output; output=$(find /etc -mtime -7 -type f 2>/dev/null)
+    spinner_stop
     echo "$output"; echo
 
     analysis_header
@@ -726,7 +732,9 @@ check_etc_modified() {
 check_bin_modified() {
     header "Recently Modified System Binaries (last 30 days)"
     desc "Rootkits replace core binaries like ps, ls, and netstat to hide their activity."
+    spinner_start "Scanning system binaries for recent modifications..."
     local output; output=$(find /usr/bin /usr/sbin /bin /sbin -mtime -30 -type f 2>/dev/null)
+    spinner_stop
     echo "$output"; echo
 
     analysis_header
@@ -764,8 +772,9 @@ check_bin_modified() {
     [ "$tier1_hit" -eq 0 ] && ok "None of the highest-risk binaries (ps, ls, ss, sshd etc.) were modified."
 
     if command -v debsums &>/dev/null; then
-        info "Running debsums integrity check..."
+        spinner_start "Running debsums integrity check (this may take a while)..."
         local debsums_fail; debsums_fail=$(sudo debsums -c 2>/dev/null | grep -v 'OK$' || true)
+        spinner_stop
         if [ -n "$debsums_fail" ]; then
             flag "debsums found hash mismatches:"
             while IFS= read -r l; do flag "  $l"; done <<< "$debsums_fail"

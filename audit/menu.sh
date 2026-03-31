@@ -178,6 +178,7 @@ run_submenu() {
     local sel=0
     local num_buf=""
 
+    tput civis
     draw_menu first "$title" "$sel" "${items[@]}"
 
     while true; do
@@ -215,6 +216,7 @@ run_submenu() {
                 num_buf=""
                 local chosen="${items[$sel]}"
                 if [ "$chosen" = "← Back" ]; then
+                    tput cnorm
                     return
                 fi
                 tput cnorm

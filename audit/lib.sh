@@ -16,7 +16,15 @@ divider()         { echo -e "${CYAN}──────────────�
 header()          { clear; echo -e "\n${BOLD}${CYAN}$1${RESET}"; divider; }
 desc()            { echo -e "${AMBER}▸ $1${RESET}"; }
 run()             { echo -e "${GREEN}\$ $1${RESET}"; eval "$1"; echo; }
-pause()           { echo -e "\n${DIM}Press Enter to return to menu...${RESET}"; read -r; }
+pause() {
+    echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
+    # Drain any input that was buffered while the check was running
+    # (the Enter used to quit less, residual escape sequences, etc.)
+    # Loop with a very short timeout until stdin is empty, then block
+    # for a genuine fresh keypress.
+    while read -r -t 0.05 _flush 2>/dev/null; do :; done
+    read -r
+}
 analysis_header() { echo -e "\n${BOLD}${CYAN}── Analysis ────────────────────────────────────────${RESET}"; }
 
 # ── Analysis markers — flag/warn also increment risk counters ─────────────────
@@ -68,4 +76,48 @@ spinner_stop() {
     fi
     # Erase the spinner line completely
     printf "\r\033[2K"
+}
+
+# ── Pager ─────────────────────────────────────────────────────────────────────
+# pager <text>
+#   Prints text directly if it fits on screen, otherwise pipes it through less
+#   so the user can scroll up and down. Colour codes are preserved via -R.
+#   Called by check functions after capturing command output.
+#
+# Usage:
+#   output=$(some_command)
+#   pager "$output"
+
+pager() {
+    local text="$1"
+    local term_lines; term_lines=$(tput lines 2>/dev/null || echo 24)
+    local text_lines; text_lines=$(echo -e "$text" | wc -l)
+
+    if [ "$text_lines" -gt $(( term_lines - 6 )) ]; then
+        # Write a temporary lesskey file so Escape quits, same as q.
+        # This works on all versions of less (lesskey has been available since v290).
+        # No -e flag: less must always wait for an explicit q or Escape.
+        # With -e, the keypress that scrolls to the end also auto-exits less,
+        # which then fires pause() immediately before you can read the analysis.
+        # -R  preserves ANSI colours
+        # -S  chops wide lines instead of wrapping
+        # -X  does not clear screen on exit
+        local lesskey_file; lesskey_file=$(mktemp /tmp/audit_lesskey.XXXXXX)
+        printf '\\e quit\n' > "$lesskey_file"
+        echo -e "$text" | LESSKEY="$lesskey_file" less -RSX
+        rm -f "$lesskey_file"
+    else
+        echo -e "$text"
+    fi
+}
+
+# run_paged CMD
+#   Runs CMD, prints the green $ prompt, and pages the output if needed.
+#   Replaces the plain run() helper for commands whose output can be long.
+
+run_paged() {
+    echo -e "${GREEN}\$ $1${RESET}"
+    local out; out=$(eval "$1" 2>&1)
+    pager "$out"
+    echo
 }

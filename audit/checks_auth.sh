@@ -64,7 +64,7 @@ check_login_history() {
     desc "Lists the last 20 logins with timestamps and source IP addresses."
     local output
     output=$(last -n 20)
-    echo "$output"
+    pager "$output"
     echo
 
     analysis_header
@@ -118,7 +118,7 @@ check_failed_logins() {
     desc "Scans auth.log for failed SSH password attempts."
     local output
     output=$(grep 'Failed password' /var/log/auth.log 2>/dev/null | tail -30)
-    [ -n "$output" ] && echo "$output" || echo "(no failed password attempts in auth.log)"
+    [ -n "$output" ] && pager "$output" || echo "(no failed password attempts in auth.log)"
     echo
 
     analysis_header
@@ -189,7 +189,7 @@ check_accepted_logins() {
     desc "Shows SSH logins that were accepted. Any login you did not initiate is an intruder."
     local output
     output=$(grep 'Accepted' /var/log/auth.log 2>/dev/null | tail -20)
-    [ -n "$output" ] && echo "$output" || echo "(no accepted logins in auth.log)"
+    [ -n "$output" ] && pager "$output" || echo "(no accepted logins in auth.log)"
     echo
 
     analysis_header
@@ -318,7 +318,7 @@ check_ssh_config() {
     desc "Reviews sshd settings for security misconfigurations."
     local output
     output=$(sudo sshd -T 2>/dev/null)
-    echo "$output" | grep -E 'permitrootlogin|passwordauth|port|pubkeyauth|maxauthtries|logingracetime|permitemptypasswords|x11forwarding|allowtcpforwarding|clientaliveinterval|banner'
+    pager "$(echo "$output" | grep -E 'permitrootlogin|passwordauth|port|pubkeyauth|maxauthtries|logingracetime|permitemptypasswords|x11forwarding|allowtcpforwarding|clientaliveinterval|banner')"
     echo
 
     analysis_header

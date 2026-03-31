@@ -6,7 +6,7 @@ check_processes() {
     header "All Running Processes"
     desc "Full process tree with CPU and memory usage."
     local output; output=$(ps auxf)
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
 
@@ -76,7 +76,7 @@ check_ports() {
     header "Listening Ports"
     desc "Shows all ports the server is listening on, correlated with the owning process."
     local output; output=$(ss -tulpn)
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
     local public; public=$(echo "$output" | grep -E '(0\.0\.0\.0|:::| \*:)' | grep LISTEN)
@@ -177,7 +177,7 @@ check_firewall() {
     echo -e "${GREEN}\$ sudo ufw status verbose${RESET}"
     local ufw_output
     ufw_output=$(sudo ufw status verbose 2>/dev/null)
-    echo "$ufw_output"
+    pager "$ufw_output"
     echo
 
     analysis_header
@@ -324,7 +324,7 @@ check_enabled_services() {
     header "Enabled Systemd Services"
     desc "Services configured to start automatically at boot."
     local output; output=$(systemctl list-unit-files --state=enabled 2>/dev/null)
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
     local known=("ssh" "cron" "nginx" "apache2" "mysql" "postgresql" "redis" "mongodb"
@@ -363,7 +363,7 @@ check_running_services() {
     header "Currently Running Services"
     desc "Services that are active right now."
     local output; output=$(systemctl list-units --type=service --state=running 2>/dev/null)
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
     local count; count=$(echo "$output" | grep -c 'running' 2>/dev/null || echo 0)
@@ -447,7 +447,7 @@ ${cron}"; found=1
 check_startup_scripts() {
     header "Startup Scripts"
     desc "Legacy SysV init scripts — another persistence location."
-    run "ls -la /etc/init.d/"
+    run_paged "ls -la /etc/init.d/"
     run "ls -la /etc/rc2.d/"
 
     analysis_header
@@ -482,7 +482,7 @@ check_shell_users() {
     header "Users With Shell Access"
     desc "Accounts that can run interactive commands."
     local output; output=$(grep -v '/nologin\|/false' /etc/passwd)
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
     local human_users
@@ -548,7 +548,7 @@ check_root_uid() {
 check_sudoers() {
     header "Sudoers Configuration"
     desc "Who can run what as root."
-    run "sudo cat /etc/sudoers"
+    run_paged "sudo cat /etc/sudoers"
     echo -e "${GREEN}\$ sudo ls /etc/sudoers.d/${RESET}"
     sudo ls /etc/sudoers.d/ 2>/dev/null; echo
 
@@ -597,7 +597,7 @@ check_suid() {
     spinner_start "Scanning filesystem for SUID binaries..."
     local output; output=$(find / -perm -4000 -type f 2>/dev/null)
     spinner_stop
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
 
@@ -671,7 +671,7 @@ check_etc_modified() {
     spinner_start "Scanning /etc for recently modified files..."
     local output; output=$(find /etc -mtime -7 -type f 2>/dev/null)
     spinner_stop
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
     local count; count=$(echo "$output" | grep -c '.' 2>/dev/null || echo 0)
@@ -764,7 +764,7 @@ check_bin_modified() {
     spinner_start "Scanning system binaries for recent modifications..."
     local output; output=$(find /usr/bin /usr/sbin /bin /sbin -mtime -30 -type f 2>/dev/null)
     spinner_stop
-    echo "$output"; echo
+    pager "$output"; echo
 
     analysis_header
     local count; count=$(echo "$output" | grep -c '.' 2>/dev/null || echo 0)

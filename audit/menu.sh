@@ -1,99 +1,98 @@
 #!/usr/bin/env bash
-# audit/menu.sh — Menu definition, box renderer, input loop
+# audit/menu.sh — Two-level menu: categories → submenus
 # Sourced by server_audit.sh after all check modules are loaded.
 
-# ── Menu items ────────────────────────────────────────────────────────────────
-# Lines starting with ── are non-selectable section headers.
+# ── Category & submenu definitions ───────────────────────────────────────────
+# MAIN_ITEMS      : labels shown on the main menu (selectable + special entries)
+# SUBMENU_<name>  : items shown when that category is selected
 
-MENU_ITEMS=(
-    "── SSH & Authentication ──────────────────"
+MAIN_ITEMS=(
+    "SSH & Authentication"
+    "Processes & Network"
+    "Persistence & Startup"
+    "Users & Permissions"
+    "File System"
+    "Malware Scanning"
+    "Run ALL checks"
+    "Quit"
+)
+
+SUBMENU_SSH=(
     "Active sessions"
     "Recent login history"
     "Failed login attempts"
     "Successful logins (possible intrusions)"
     "Authorized SSH keys"
     "SSH daemon config"
-    "── Processes & Network ───────────────────"
+    "Run all SSH & Auth checks"
+    "← Back"
+)
+
+SUBMENU_NETWORK=(
     "All running processes"
     "Listening ports"
     "Established outbound connections"
-    "── Persistence & Startup ─────────────────"
+    "Run all Processes & Network checks"
+    "← Back"
+)
+
+SUBMENU_PERSISTENCE=(
     "Enabled systemd services"
     "Currently running services"
     "Crontabs (all users)"
     "Startup scripts (init.d / rc*.d)"
-    "── Users & Permissions ───────────────────"
+    "Run all Persistence & Startup checks"
+    "← Back"
+)
+
+SUBMENU_USERS=(
     "Users with shell access"
     "Users with root UID (UID 0)"
     "Sudoers configuration"
     "Files with SUID bit set"
-    "── File System ───────────────────────────"
+    "Run all Users & Permissions checks"
+    "← Back"
+)
+
+SUBMENU_FILESYSTEM=(
     "Recently modified /etc files (7 days)"
     "Recently modified system binaries (30 days)"
     "Hidden files in /tmp and /var/tmp"
-    "── Malware Scanning ──────────────────────"
+    "Run all File System checks"
+    "← Back"
+)
+
+SUBMENU_MALWARE=(
     "Install & run rkhunter"
     "Install & run chkrootkit"
     "Install & run ClamAV"
     "Check for crypto miners"
-    "── Bulk ──────────────────────────────────"
-    "Run ALL checks (no scanners)"
-    "Quit"
+    "Run all Malware checks"
+    "← Back"
 )
 
-# ── Index maps ────────────────────────────────────────────────────────────────
-
-declare -A IDX_TO_NUM   # array index  → display number
-declare -A NUM_TO_IDX   # display number → array index
-_num=1
-for _i in "${!MENU_ITEMS[@]}"; do
-    if [[ "${MENU_ITEMS[$_i]}" != ──* ]]; then
-        IDX_TO_NUM[$_i]=$_num
-        NUM_TO_IDX[$_num]=$_i
-        (( _num++ ))
-    fi
-done
-MAX_NUM=$(( _num - 1 ))
-
-is_separator()    { [[ "${MENU_ITEMS[$1]}" == ──* ]]; }
-
-next_selectable() {
-    local i=$(( SELECTED + 1 ))
-    while [ "$i" -lt "${#MENU_ITEMS[@]}" ]; do
-        is_separator "$i" || { echo "$i"; return; }
-        (( i++ ))
-    done
-    echo "$SELECTED"
-}
-
-prev_selectable() {
-    local i=$(( SELECTED - 1 ))
-    while [ "$i" -ge 0 ]; do
-        is_separator "$i" || { echo "$i"; return; }
-        (( i-- ))
-    done
-    echo "$SELECTED"
+# ── Clean exit ───────────────────────────────────────────────────────────────
+# Moves the cursor back to the top of the menu block and erases exactly the
+# lines the menu drew — leaving everything above it in the terminal untouched.
+_quit() {
+    tput cnorm   # restore cursor
+    tput rmcup   # restore original screen — everything before launch reappears
+    exit 0
 }
 
 # ── Box drawing ───────────────────────────────────────────────────────────────
-# BOX_INNER is the inner width of the box, computed from the longest menu item.
-# All padding arithmetic uses plain (no-ANSI) strings to stay accurate.
+# Computed fresh each time a menu is drawn from the items passed to draw_menu.
 
-BOX_INNER=0
-_build_box_width() {
-    local max=0
-    for i in "${!MENU_ITEMS[@]}"; do
-        local plain
-        if is_separator "$i"; then
-            plain="   ${MENU_ITEMS[$i]}  "
-        else
-            plain="  ${IDX_TO_NUM[$i]}.   ${MENU_ITEMS[$i]}  "
-        fi
+_compute_box_width() {
+    # $@ = menu item strings; sets BOX_INNER
+    local max=0 i=1
+    for item in "$@"; do
+        local plain="  ${i}.   ${item}  "
         (( ${#plain} > max )) && max=${#plain}
+        (( i++ ))
     done
     BOX_INNER=$max
 }
-_build_box_width
 
 _hrule() {
     printf '%s' "$1"
@@ -102,122 +101,195 @@ _hrule() {
 }
 
 _box_row() {
-    # $1 = plain content (for length measurement), $2 = colored content (printed)
+    # $1 = plain string (for width), $2 = colored string (printed)
     local pad=$(( BOX_INNER - ${#1} ))
     printf '│'; printf '%b' "$2"; printf '%*s' "$pad" ''; printf '│\n'
 }
 
-# ── Flicker-free draw ─────────────────────────────────────────────────────────
-# On first call: clear + draw. On subsequent calls: cursor-up + overwrite in
-# place, so the menu never blanks (no flash on arrow key presses).
+# ── Generic menu renderer ─────────────────────────────────────────────────────
+# draw_menu FIRST|"" TITLE SELECTED_IDX ITEM [ITEM ...]
+#   FIRST    : pass "first" to clear screen, anything else to redraw in-place
+#   TITLE    : subtitle shown inside the banner (e.g. "SSH & Authentication")
+#   SEL      : 0-based index of the highlighted item
 
 MENU_LINE_COUNT=0
 
 draw_menu() {
-    local first_draw="${1:-}"
+    local first_draw="$1" title="$2" sel="$3"
+    shift 3
+    local items=("$@")
+
     [ "$first_draw" = "first" ] && clear || printf '\033[%dA' "$MENU_LINE_COUNT"
+
+    _compute_box_width "${items[@]}"
 
     local lines=0
     _line() { printf '\033[2K'; printf '%b\n' "$1"; (( lines++ )); }
 
+    # ── Banner ──
     _line "${BOLD}"
     _line "  ╔══════════════════════════════════════════╗"
     _line "  ║       Ubuntu Server Security Audit       ║"
     _line "  ╚══════════════════════════════════════════╝"
     _line "${RESET}"
+
+    # ── Disclaimer ──
     _line "  ${AMBER}${BOLD}⚠  Disclaimer${RESET}"
     _line "  ${AMBER}Always independently verify command outputs.${RESET}"
     _line "  ${AMBER}Do not rely solely on this script to assess server security.${RESET}"
     _line ""
+
+    # ── Subtitle (category name, empty on main menu) ──
+    if [ -n "$title" ]; then
+        _line "  ${BOLD}${CYAN}${title}${RESET}"
+        _line ""
+    fi
+
+    # ── Box ──
     _line "  $(_hrule ┌ ─ ┐)"
 
     local i
-    for i in "${!MENU_ITEMS[@]}"; do
-        local item="${MENU_ITEMS[$i]}"
-        if is_separator "$i"; then
-            [ "$i" -ne 0 ] && _line "  $(_hrule ├ ─ ┤)"
-            _line "  $(_box_row "   ${item}  " "${DIM}   ${item}  ${RESET}")"
+    for i in "${!items[@]}"; do
+        local item="${items[$i]}"
+        local num=$(( i + 1 ))
+        if [ "$i" -eq "$sel" ]; then
+            _line "  $(_box_row "  ${num}. ❯ ${item}  " "${CYAN}${BOLD}  ${num}. ❯ ${item}  ${RESET}")"
         else
-            local num="${IDX_TO_NUM[$i]}"
-            if [ "$i" -eq "$SELECTED" ]; then
-                _line "  $(_box_row "  ${num}. ❯ ${item}  " "${CYAN}${BOLD}  ${num}. ❯ ${item}  ${RESET}")"
-            else
-                _line "  $(_box_row "  ${num}.   ${item}  " "${DIM}  ${num}.${RESET}   ${item}  ")"
-            fi
+            _line "  $(_box_row "  ${num}.   ${item}  " "${DIM}  ${num}.${RESET}   ${item}  ")"
         fi
     done
 
     _line "  $(_hrule └ ─ ┘)"
     _line ""
     _line "  ${DIM}↑ ↓ arrow keys  or  type a number + Enter  │  q to quit${RESET}"
+
     MENU_LINE_COUNT=$lines
 }
 
-# ── Dispatch ──────────────────────────────────────────────────────────────────
+# ── Generic submenu runner ────────────────────────────────────────────────────
+# run_submenu TITLE ITEM [ITEM ...]
+# Loops until the user selects "← Back", then returns to the caller.
 
-dispatch() {
-    case "${MENU_ITEMS[$1]}" in
+run_submenu() {
+    local title="$1"; shift
+    local items=("$@")
+    local count=${#items[@]}
+    local sel=0
+    local num_buf=""
+
+    draw_menu first "$title" "$sel" "${items[@]}"
+
+    while true; do
+        IFS= read -rsn1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            read -rsn2 -t 0.1 rest
+            key="${key}${rest}"
+        fi
+
+        case "$key" in
+            $'\x1b[A'|$'\x1b[OA')   # up
+                num_buf=""
+                (( sel > 0 )) && (( sel-- ))
+                draw_menu "" "$title" "$sel" "${items[@]}" ;;
+            $'\x1b[B'|$'\x1b[OB')   # down
+                num_buf=""
+                (( sel < count - 1 )) && (( sel++ ))
+                draw_menu "" "$title" "$sel" "${items[@]}" ;;
+            [0-9])
+                local tentative="${num_buf}${key}"
+                if [ "$tentative" -le "$count" ] 2>/dev/null && [ "$tentative" -ge 1 ]; then
+                    num_buf="$tentative"
+                    sel=$(( num_buf - 1 ))
+                    draw_menu "" "$title" "$sel" "${items[@]}"
+                fi ;;
+            $'\x7f'|$'\x08')         # backspace
+                if [ -n "$num_buf" ]; then
+                    num_buf="${num_buf%?}"
+                    if [ -n "$num_buf" ] && [ "$num_buf" -ge 1 ] && [ "$num_buf" -le "$count" ] 2>/dev/null; then
+                        sel=$(( num_buf - 1 ))
+                    fi
+                    draw_menu "" "$title" "$sel" "${items[@]}"
+                fi ;;
+            '')                       # enter
+                num_buf=""
+                local chosen="${items[$sel]}"
+                if [ "$chosen" = "← Back" ]; then
+                    return
+                fi
+                tput cnorm
+                submenu_dispatch "$chosen"
+                tput civis
+                draw_menu first "$title" "$sel" "${items[@]}" ;;
+            q|Q)
+                _quit ;;
+        esac
+    done
+}
+
+# ── Submenu dispatch ──────────────────────────────────────────────────────────
+# Maps every leaf item label to its check function.
+
+submenu_dispatch() {
+    case "$1" in
+        # SSH & Auth
         "Active sessions")                              check_active_sessions ;;
         "Recent login history")                         check_login_history ;;
         "Failed login attempts")                        check_failed_logins ;;
         "Successful logins (possible intrusions)")      check_accepted_logins ;;
         "Authorized SSH keys")                          check_ssh_keys ;;
         "SSH daemon config")                            check_ssh_config ;;
+        "Run all SSH & Auth checks")
+            check_active_sessions; check_login_history; check_failed_logins
+            check_accepted_logins; check_ssh_keys; check_ssh_config ;;
+        # Processes & Network
         "All running processes")                        check_processes ;;
         "Listening ports")                              check_ports ;;
         "Established outbound connections")             check_outbound ;;
+        "Run all Processes & Network checks")
+            check_processes; check_ports; check_outbound ;;
+        # Persistence & Startup
         "Enabled systemd services")                     check_enabled_services ;;
         "Currently running services")                   check_running_services ;;
         "Crontabs (all users)")                         check_crontabs ;;
         "Startup scripts (init.d / rc*.d)")             check_startup_scripts ;;
+        "Run all Persistence & Startup checks")
+            check_enabled_services; check_running_services
+            check_crontabs; check_startup_scripts ;;
+        # Users & Permissions
         "Users with shell access")                      check_shell_users ;;
         "Users with root UID (UID 0)")                  check_root_uid ;;
         "Sudoers configuration")                        check_sudoers ;;
         "Files with SUID bit set")                      check_suid ;;
+        "Run all Users & Permissions checks")
+            check_shell_users; check_root_uid; check_sudoers; check_suid ;;
+        # File System
         "Recently modified /etc files (7 days)")        check_etc_modified ;;
         "Recently modified system binaries (30 days)")  check_bin_modified ;;
         "Hidden files in /tmp and /var/tmp")            check_tmp_hidden ;;
+        "Run all File System checks")
+            check_etc_modified; check_bin_modified; check_tmp_hidden ;;
+        # Malware
         "Install & run rkhunter")                       check_rkhunter ;;
         "Install & run chkrootkit")                     check_chkrootkit ;;
         "Install & run ClamAV")                         check_clamav ;;
         "Check for crypto miners")                      check_miners ;;
-        "Run ALL checks (no scanners)")                 run_all ;;
-        "Quit")                                         tput cnorm; echo "Bye."; exit 0 ;;
+        "Run all Malware checks")
+            check_rkhunter; check_chkrootkit; check_clamav; check_miners ;;
     esac
 }
 
-# ── Number input ──────────────────────────────────────────────────────────────
-
-NUMBER_BUF=""
-
-handle_digit() {
-    local tentative="${NUMBER_BUF}$1"
-    if [ "$tentative" -le "$MAX_NUM" ] 2>/dev/null; then
-        NUMBER_BUF="$tentative"
-        local idx="${NUM_TO_IDX[$NUMBER_BUF]}"
-        [ -n "$idx" ] && SELECTED="$idx" && draw_menu
-    fi
-}
-
-handle_backspace() {
-    if [ -n "$NUMBER_BUF" ]; then
-        NUMBER_BUF="${NUMBER_BUF%?}"
-        if [ -n "$NUMBER_BUF" ]; then
-            local idx="${NUM_TO_IDX[$NUMBER_BUF]}"
-            [ -n "$idx" ] && SELECTED="$idx"
-        fi
-        draw_menu
-    fi
-}
-
-# ── Main input loop ───────────────────────────────────────────────────────────
+# ── Main menu runner ──────────────────────────────────────────────────────────
 
 run_menu() {
+    tput smcup  # switch to alternate screen buffer
     tput civis
-    trap 'tput cnorm; echo' EXIT
+    trap '_quit' EXIT INT TERM
 
-    SELECTED=1
-    draw_menu first
+    local sel=0
+    local count=${#MAIN_ITEMS[@]}
+    local num_buf=""
+
+    draw_menu first "" "$sel" "${MAIN_ITEMS[@]}"
 
     while true; do
         IFS= read -rsn1 key
@@ -228,17 +300,69 @@ run_menu() {
 
         case "$key" in
             $'\x1b[A'|$'\x1b[OA')
-                NUMBER_BUF=""; SELECTED=$(prev_selectable); draw_menu ;;
+                num_buf=""
+                (( sel > 0 )) && (( sel-- ))
+                draw_menu "" "" "$sel" "${MAIN_ITEMS[@]}" ;;
             $'\x1b[B'|$'\x1b[OB')
-                NUMBER_BUF=""; SELECTED=$(next_selectable); draw_menu ;;
-            $'\x7f'|$'\x08')
-                handle_backspace ;;
+                num_buf=""
+                (( sel < count - 1 )) && (( sel++ ))
+                draw_menu "" "" "$sel" "${MAIN_ITEMS[@]}" ;;
             [0-9])
-                handle_digit "$key" ;;
+                local tentative="${num_buf}${key}"
+                if [ "$tentative" -le "$count" ] 2>/dev/null && [ "$tentative" -ge 1 ]; then
+                    num_buf="$tentative"
+                    sel=$(( num_buf - 1 ))
+                    draw_menu "" "" "$sel" "${MAIN_ITEMS[@]}"
+                fi ;;
+            $'\x7f'|$'\x08')
+                if [ -n "$num_buf" ]; then
+                    num_buf="${num_buf%?}"
+                    if [ -n "$num_buf" ] && [ "$num_buf" -ge 1 ] && [ "$num_buf" -le "$count" ] 2>/dev/null; then
+                        sel=$(( num_buf - 1 ))
+                    fi
+                    draw_menu "" "" "$sel" "${MAIN_ITEMS[@]}"
+                fi ;;
             '')
-                NUMBER_BUF=""; tput cnorm; dispatch "$SELECTED"; tput civis; draw_menu first ;;
+                num_buf=""
+                case "${MAIN_ITEMS[$sel]}" in
+                    "SSH & Authentication")
+                        tput cnorm
+                        run_submenu "SSH & Authentication" "${SUBMENU_SSH[@]}"
+                        tput civis
+                        draw_menu first "" "$sel" "${MAIN_ITEMS[@]}" ;;
+                    "Processes & Network")
+                        tput cnorm
+                        run_submenu "Processes & Network" "${SUBMENU_NETWORK[@]}"
+                        tput civis
+                        draw_menu first "" "$sel" "${MAIN_ITEMS[@]}" ;;
+                    "Persistence & Startup")
+                        tput cnorm
+                        run_submenu "Persistence & Startup" "${SUBMENU_PERSISTENCE[@]}"
+                        tput civis
+                        draw_menu first "" "$sel" "${MAIN_ITEMS[@]}" ;;
+                    "Users & Permissions")
+                        tput cnorm
+                        run_submenu "Users & Permissions" "${SUBMENU_USERS[@]}"
+                        tput civis
+                        draw_menu first "" "$sel" "${MAIN_ITEMS[@]}" ;;
+                    "File System")
+                        tput cnorm
+                        run_submenu "File System" "${SUBMENU_FILESYSTEM[@]}"
+                        tput civis
+                        draw_menu first "" "$sel" "${MAIN_ITEMS[@]}" ;;
+                    "Malware Scanning")
+                        tput cnorm
+                        run_submenu "Malware Scanning" "${SUBMENU_MALWARE[@]}"
+                        tput civis
+                        draw_menu first "" "$sel" "${MAIN_ITEMS[@]}" ;;
+                    "Run ALL checks")
+                        tput cnorm; run_all; tput civis
+                        draw_menu first "" "$sel" "${MAIN_ITEMS[@]}" ;;
+                    "Quit")
+                        _quit ;;
+                esac ;;
             q|Q)
-                tput cnorm; echo "Bye."; exit 0 ;;
+                _quit ;;
         esac
     done
 }

@@ -53,10 +53,11 @@ check_processes() {
     fi
 
     # Unknown root processes
-    local known_root=("systemd" "sshd" "cron" "nginx" "rsyslogd" "agetty" "multipathd"
-        "snapd" "amazon-ssm" "udisksd" "ModemManager" "polkitd" "irqbalance"
-        "chronyd" "unattended" "networkd-dispatcher" "python3" "udevd" "journald"
-        "logind" "acpid" "dbus-daemon" "init" "bash" "sh" "ps" "grep" "awk")
+    local known_root=("systemd" "sshd" "crond" "nginx" "rsyslogd" "agetty" "multipathd"
+        "udisksd" "ModemManager" "polkitd" "irqbalance"
+        "chronyd" "NetworkManager" "python3" "udevd" "journald"
+        "logind" "acpid" "dbus-daemon" "dbus-broker" "init" "bash" "sh" "ps" "grep" "awk"
+        "firewalld" "tuned" "sssd" "gssproxy" "auditd" "sedispatch")
     local suspicious_root
     suspicious_root=$(echo "$output" | awk 'NR>1 && $1=="root" && $11!~/^\[/ {print $2, $11}' | while read -r pid cmd; do
         base=$(basename "$cmd" 2>/dev/null || echo "$cmd"); known=0
@@ -94,7 +95,7 @@ check_ports() {
             ok "Port ${BOLD}$port${RESET} ($process) — expected."
         else
             warn "Port ${BOLD}$port${RESET} ($process) is publicly exposed — verify this is intentional."
-            fix "If not needed: sudo ufw deny $port && sudo systemctl stop <service>"
+            fix "If not needed: sudo firewall-cmd --permanent --remove-port=$port/tcp && sudo firewall-cmd --reload"
             flagged_ports=$(( flagged_ports + 1 ))
         fi
     done <<< "$public"
@@ -148,7 +149,7 @@ check_outbound() {
         while IFS= read -r ip; do
             local proc; proc=$(echo "$output" | grep "$ip" | grep -oP '(?<=\(\(")[^"]+' | head -1 || echo "unknown")
             if echo "$ip" | grep -qE '^(169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'; then
-                ok "  ${BOLD}$ip${RESET} ($proc) — AWS link-local/metadata, expected."
+                ok "  ${BOLD}$ip${RESET} ($proc) — cloud link-local/metadata, expected."
             else
                 info "  ${BOLD}$ip${RESET} ($proc)"
                 fix "  Verify: whois $ip  or  curl -s https://ipinfo.io/$ip"
@@ -170,138 +171,141 @@ check_outbound() {
 }
 
 check_firewall() {
-    header "Firewall (UFW)"
-    desc "Audits UFW status, default policies, active rules, and cross-references open ports."
+    header "Firewall (firewalld)"
+    desc "Audits firewalld status, default zone, active rules, and cross-references open ports."
 
     # ── Raw output ────────────────────────────────────────────────────────────
-    echo -e "${GREEN}\$ sudo ufw status verbose${RESET}"
-    local ufw_output
-    ufw_output=$(sudo ufw status verbose 2>/dev/null)
-    pager "$ufw_output"
+    echo -e "${GREEN}\$ sudo firewall-cmd --state${RESET}"
+    local fw_state
+    fw_state=$(sudo firewall-cmd --state 2>/dev/null || echo "not running")
+    echo "$fw_state"
+    echo
+
+    echo -e "${GREEN}\$ sudo firewall-cmd --list-all${RESET}"
+    local fw_output
+    fw_output=$(sudo firewall-cmd --list-all 2>/dev/null)
+    pager "$fw_output"
     echo
 
     analysis_header
 
-    # ── UFW installed? ────────────────────────────────────────────────────────
-    if ! command -v ufw &>/dev/null; then
-        flag "UFW is not installed — no firewall is protecting this server."
-        fix "Install and enable: sudo apt install ufw -y && sudo ufw default deny incoming && sudo ufw allow 22 && sudo ufw enable"
+    # ── firewalld installed? ──────────────────────────────────────────────────
+    if ! command -v firewall-cmd &>/dev/null; then
+        flag "firewalld is not installed — no firewall is protecting this server."
+        fix "Install and enable: sudo dnf install firewalld -y && sudo systemctl enable --now firewalld"
         pause; return
     fi
 
-    # ── UFW active? ───────────────────────────────────────────────────────────
-    local status
-    status=$(sudo ufw status 2>/dev/null | head -1)
-    if echo "$status" | grep -qi "inactive"; then
-        flag "UFW is installed but ${BOLD}inactive${RESET} — the firewall is off and all ports are unprotected."
-        fix "Enable UFW: sudo ufw enable"
-        fix "Before enabling, ensure port 22 is allowed: sudo ufw allow 22"
+    # ── firewalld active? ─────────────────────────────────────────────────────
+    if [ "$fw_state" != "running" ]; then
+        flag "firewalld is installed but ${BOLD}not running${RESET} — the firewall is off and all ports are unprotected."
+        fix "Enable firewalld: sudo systemctl enable --now firewalld"
+        fix "Before enabling, ensure SSH is allowed in the default zone."
         pause; return
     fi
-    ok "UFW is active."
+    ok "firewalld is active."
 
-    # ── Default policies ──────────────────────────────────────────────────────
-    local default_in default_out default_fwd
-    default_in=$(echo  "$ufw_output" | grep -i 'default.*incoming' | grep -oiE 'deny|allow|reject' | head -1)
-    default_out=$(echo "$ufw_output" | grep -i 'default.*outgoing' | grep -oiE 'deny|allow|reject' | head -1)
-    default_fwd=$(echo "$ufw_output" | grep -i 'default.*forward'  | grep -oiE 'deny|allow|reject' | head -1)
+    # ── Default zone ──────────────────────────────────────────────────────────
+    local default_zone
+    default_zone=$(sudo firewall-cmd --get-default-zone 2>/dev/null)
+    info "Default zone: ${BOLD}$default_zone${RESET}"
 
-    case "${default_in,,}" in
-        deny|reject) ok "Default incoming policy: ${BOLD}${default_in}${RESET} — only explicitly allowed ports are reachable." ;;
-        allow)       flag "Default incoming policy: ${BOLD}ALLOW${RESET} — all ports are open unless explicitly blocked."
-                     fix "Set a safe default: sudo ufw default deny incoming" ;;
-        *)           warn "Could not determine default incoming policy — verify manually: sudo ufw status verbose" ;;
+    local zone_target
+    zone_target=$(sudo firewall-cmd --zone="$default_zone" --get-target 2>/dev/null || echo "default")
+
+    case "$zone_target" in
+        default|DROP|%%REJECT%%)
+            ok "Zone target is '${zone_target}' — incoming traffic is blocked by default." ;;
+        ACCEPT)
+            flag "Zone target is 'ACCEPT' — all incoming traffic is allowed by default!"
+            fix "Set a safe target: sudo firewall-cmd --permanent --zone=$default_zone --set-target=default && sudo firewall-cmd --reload" ;;
+        *)
+            info "Zone target: $zone_target" ;;
     esac
-
-    case "${default_out,,}" in
-        allow)       ok "Default outgoing policy: ${BOLD}ALLOW${RESET} — normal for most servers." ;;
-        deny|reject) warn "Default outgoing policy: ${BOLD}${default_out}${RESET} — legitimate services may be blocked."
-                     info "Ensure DNS (53), HTTP (80), HTTPS (443), and NTP (123) are explicitly allowed out." ;;
-        *)           info "Default outgoing policy: ${default_out:-unknown}" ;;
-    esac
-
-    [ -n "$default_fwd" ] && info "Default forwarding policy: ${BOLD}$default_fwd${RESET}"
-
-    # ── Parse active rules ────────────────────────────────────────────────────
-    local rules
-    rules=$(sudo ufw status numbered 2>/dev/null | grep '^\[')
-
-    if [ -z "$rules" ]; then
-        warn "No UFW rules defined — UFW is active but allowing nothing in by default."
-        fix "At minimum allow SSH: sudo ufw allow 22/tcp"
-        pause; return
-    fi
 
     # ── SSH rule check — must exist or you risk lockout ──────────────────────
     local ssh_port
     ssh_port=$(sudo sshd -T 2>/dev/null | grep '^port ' | awk '{print $2}')
     ssh_port="${ssh_port:-22}"
 
-    local ssh_rule_found=0
-    echo "$rules" | grep -qE "(${ssh_port}[^0-9]|OpenSSH|ssh)" && ssh_rule_found=1
-    if [ "$ssh_rule_found" -eq 0 ]; then
-        flag "No UFW rule found for SSH (port ${ssh_port}) — you may be locked out after a reconnect."
-        fix "Add rule immediately: sudo ufw allow ${ssh_port}/tcp"
+    local ssh_allowed=0
+    # Check services
+    local allowed_services
+    allowed_services=$(sudo firewall-cmd --zone="$default_zone" --list-services 2>/dev/null)
+    echo "$allowed_services" | grep -qw 'ssh' && ssh_allowed=1
+
+    # Check ports
+    local allowed_ports
+    allowed_ports=$(sudo firewall-cmd --zone="$default_zone" --list-ports 2>/dev/null)
+    echo "$allowed_ports" | grep -qE "(^|[[:space:]])${ssh_port}/tcp" && ssh_allowed=1
+
+    if [ "$ssh_allowed" -eq 0 ]; then
+        flag "No firewalld rule found for SSH (port ${ssh_port}) — you may be locked out after a reconnect."
+        fix "Add rule immediately: sudo firewall-cmd --permanent --zone=$default_zone --add-service=ssh && sudo firewall-cmd --reload"
     else
-        ok "SSH (port ${ssh_port}) has an allow rule — remote access is protected."
+        ok "SSH (port ${ssh_port}) is allowed — remote access is protected."
     fi
 
-    # ── Overly permissive rules ───────────────────────────────────────────────
-    # Rules allowing ANY source on sensitive ports
-    local any_rules
-    any_rules=$(echo "$rules" | grep -v '^\[.*\].*Anywhere.*DENY\|REJECT'         | grep -E 'ALLOW\s+Anywhere|ALLOW IN\s+Anywhere' || true)
-
-    local dangerous_ports=(21 23 25 53 110 135 139 143 445 1433 1521 2375 2376 3306 3389 5432 5900 6379 8080 27017)
+    # ── Allowed services analysis ─────────────────────────────────────────────
+    local dangerous_services=("ftp" "telnet" "tftp" "vnc-server" "mysql" "postgresql"
+        "redis" "mongodb-server" "rpc-bind" "nfs" "samba" "smtp" "pop3" "imap")
     local found_dangerous=0
-    while IFS= read -r rule; do
-        [ -z "$rule" ] && continue
-        for p in "${dangerous_ports[@]}"; do
-            if echo "$rule" | grep -qE "(^|[^0-9])${p}([^0-9]|$)"; then
-                flag "Port ${BOLD}$p${RESET} is allowed from ${BOLD}Anywhere${RESET} — this is a high-risk service port."
-                echo "  $rule"
-                fix "  Restrict to a specific IP: sudo ufw delete <rule_number> && sudo ufw allow from <your-ip> to any port $p"
-                found_dangerous=1
-            fi
-        done
-    done <<< "$any_rules"
-    [ "$found_dangerous" -eq 0 ] && ok "No high-risk service ports are open to the world."
+    for svc in "${dangerous_services[@]}"; do
+        if echo "$allowed_services" | grep -qw "$svc"; then
+            flag "Service ${BOLD}$svc${RESET} is allowed — this is a high-risk service exposed to the network."
+            fix "  Remove if not needed: sudo firewall-cmd --permanent --zone=$default_zone --remove-service=$svc && sudo firewall-cmd --reload"
+            found_dangerous=1
+        fi
+    done
+    [ "$found_dangerous" -eq 0 ] && ok "No high-risk services are open to the world."
 
-    # ── Rules allowing all traffic from Anywhere (no port restriction) ────────
-    local wildcard_rules
-    wildcard_rules=$(echo "$rules" | grep -E 'ALLOW\s+Anywhere$|ALLOW IN\s+Anywhere$'         | grep -v '/\|port\|[0-9]' || true)
-    if [ -n "$wildcard_rules" ]; then
-        flag "Rule(s) allowing ALL traffic from Anywhere — no port restriction:"
-        while IFS= read -r r; do flag "  $r"; done <<< "$wildcard_rules"
-        fix "Replace with specific port rules and delete the wildcard: sudo ufw status numbered, then sudo ufw delete <n>"
-    fi
+    # ── Open ports analysis ───────────────────────────────────────────────────
+    local dangerous_ports=(21 23 25 53 110 135 139 143 445 1433 1521 2375 2376 3306 3389 5432 5900 6379 8080 27017)
+    local found_dangerous_port=0
+    for p in "${dangerous_ports[@]}"; do
+        if echo "$allowed_ports" | grep -qE "(^|[[:space:]])${p}/"; then
+            flag "Port ${BOLD}$p${RESET} is explicitly opened — this is a high-risk port."
+            fix "  Remove if not needed: sudo firewall-cmd --permanent --zone=$default_zone --remove-port=${p}/tcp && sudo firewall-cmd --reload"
+            found_dangerous_port=1
+        fi
+    done
+    [ "$found_dangerous_port" -eq 0 ] && ok "No high-risk ports are explicitly opened."
 
-    # ── IPv6 rules ────────────────────────────────────────────────────────────
-    local ipv6_rules; ipv6_rules=$(echo "$rules" | grep -c 'v6' || echo 0)
-    local ipv4_rules; ipv4_rules=$(echo "$rules" | grep -cv 'v6' || echo 0)
-    if [ "$ipv6_rules" -gt 0 ]; then
-        ok "IPv6 rules present ($ipv6_rules rule(s)) — both IPv4 and IPv6 are covered."
-    else
-        warn "No IPv6 rules found — if IPv6 is enabled on this server, it may be unfiltered."
-        fix "Check: ip -6 addr show. If IPv6 is active, mirror your IPv4 rules for IPv6."
+    # ── Rich rules ────────────────────────────────────────────────────────────
+    local rich_rules
+    rich_rules=$(sudo firewall-cmd --zone="$default_zone" --list-rich-rules 2>/dev/null)
+    if [ -n "$rich_rules" ]; then
+        info "Rich rules configured:"
+        while IFS= read -r r; do
+            info "  $r"
+            echo "$r" | grep -qi 'accept' && echo "$r" | grep -qiv 'source' \
+                && warn "  ↳ This rich rule accepts traffic without a source restriction — review it."
+        done <<< "$rich_rules"
     fi
 
     # ── Cross-reference: open ports vs firewall rules ─────────────────────────
     info "Cross-referencing listening ports against firewall rules..."
     local listening_ports
-    listening_ports=$(ss -tulpn 2>/dev/null         | grep -E '0\.0\.0\.0:|:::' | grep LISTEN         | grep -oE ':[0-9]+\s' | tr -d ': ' | sort -un)
+    listening_ports=$(ss -tulpn 2>/dev/null \
+        | grep -E '0\.0\.0\.0:|:::' | grep LISTEN \
+        | grep -oE ':[0-9]+\s' | tr -d ': ' | sort -un)
 
     local unprotected=0
     while IFS= read -r port; do
         [ -z "$port" ] && continue
-        # Check if this port has a UFW allow rule
         local covered=0
-        echo "$rules" | grep -qE "(^|[^0-9])${port}([^0-9]|$|/)" && covered=1
-        # Also consider it covered if default incoming is deny (all not-allowed = blocked)
-        [ "${default_in,,}" = "deny" ] || [ "${default_in,,}" = "reject" ] && covered=1
+        # Check if port is in allowed ports list
+        echo "$allowed_ports" | grep -qE "(^|[[:space:]])${port}/" && covered=1
+        # Check if a known service maps to this port
+        [ "$port" = "22" ] && echo "$allowed_services" | grep -qw 'ssh' && covered=1
+        [ "$port" = "80" ] && echo "$allowed_services" | grep -qwE 'http|http$' && covered=1
+        [ "$port" = "443" ] && echo "$allowed_services" | grep -qw 'https' && covered=1
+        # If zone target is not ACCEPT, unlisted ports are blocked — that's good
+        [ "$zone_target" != "ACCEPT" ] && covered=1
 
-        if [ "$covered" -eq 0 ] && [ "${default_in,,}" = "allow" ]; then
-            warn "Port ${BOLD}$port${RESET} is listening publicly but has no explicit UFW rule."
-            fix "  Add a rule or block it: sudo ufw allow $port  or  sudo ufw deny $port"
+        if [ "$covered" -eq 0 ]; then
+            warn "Port ${BOLD}$port${RESET} is listening publicly but may not be covered by firewall rules."
+            fix "  Verify: sudo firewall-cmd --zone=$default_zone --query-port=$port/tcp"
             unprotected=$(( unprotected + 1 ))
         fi
     done <<< "$listening_ports"
@@ -309,12 +313,12 @@ check_firewall() {
 
     # ── Logging ───────────────────────────────────────────────────────────────
     local logging
-    logging=$(echo "$ufw_output" | grep -i 'logging' | head -1 || true)
-    if echo "$logging" | grep -qi 'off\|disabled'; then
-        warn "UFW logging is off — blocked connection attempts are not being recorded."
-        fix "Enable logging: sudo ufw logging on"
-    elif [ -n "$logging" ]; then
-        ok "UFW logging is enabled: $logging"
+    logging=$(sudo firewall-cmd --get-log-denied 2>/dev/null || echo "unknown")
+    if [ "$logging" = "off" ]; then
+        warn "Firewall denied-packet logging is off — blocked connection attempts are not being recorded."
+        fix "Enable logging: sudo firewall-cmd --set-log-denied=all"
+    elif [ "$logging" != "unknown" ]; then
+        ok "Firewall denied-packet logging is enabled: $logging"
     fi
 
     pause
@@ -327,15 +331,18 @@ check_enabled_services() {
     pager "$output"; echo
 
     analysis_header
-    local known=("ssh" "cron" "nginx" "apache2" "mysql" "postgresql" "redis" "mongodb"
-        "ufw" "rsyslog" "chrony" "ntp" "snapd" "systemd-" "dbus" "network"
-        "resolved" "logind" "udevd" "multipathd" "unattended" "ModemManager"
-        "polkit" "udisks2" "amazon-ssm" "cloud-" "iscsid" "open-iscsi"
-        "irqbalance" "acpid" "apparmor" "apport" "grub" "plymouth" "procps"
-        "rsync" "sysstat" "uuidd" "hibagent" "open-vm-tools" "screen-cleanup"
+    local known=("sshd" "crond" "nginx" "httpd" "apache2" "mariadb" "mysql" "postgresql" "redis" "mongodb"
+        "firewalld" "rsyslog" "chrony" "chronyd" "ntp" "systemd-" "dbus" "dbus-broker" "network"
+        "NetworkManager" "resolved" "logind" "udevd" "multipathd"
+        "polkit" "udisks2" "irqbalance" "acpid" "selinux" "auditd"
+        "grub" "plymouth" "procps" "rsync" "sysstat" "tuned"
         "fail2ban" "docker" "containerd" "kubelet" "php" "node" "gunicorn"
-        "uwsgi" "postfix" "dovecot" "bind9" "named" "avahi" "cups" "bluetooth"
-        "thermald" "fwupd" "packagekit" "gdm" "lightdm" "snap." "lxd")
+        "uwsgi" "postfix" "dovecot" "named" "avahi" "cups" "bluetooth"
+        "thermald" "fwupd" "packagekit" "gdm" "lightdm" "sddm"
+        "sssd" "gssproxy" "dnf-makecache" "import-state" "loadmodules"
+        "nis-domainname" "kdump" "microcode" "lvm2" "mdmonitor"
+        "smartd" "abrtd" "cockpit" "libvirtd" "qemu-guest-agent"
+        "cloud-" "initial-setup" "rngd" "selinux-autorelabel")
 
     local unknown_services=()
     while IFS= read -r line; do
@@ -347,7 +354,7 @@ check_enabled_services() {
     done <<< "$(echo "$output" | grep 'enabled')"
 
     if [ "${#unknown_services[@]}" -eq 0 ]; then
-        ok "All enabled services match known Ubuntu/AWS service patterns."
+        ok "All enabled services match known Fedora service patterns."
     else
         warn "${#unknown_services[@]} service(s) not in the known-legitimate list — review:"
         for s in "${unknown_services[@]}"; do
@@ -448,14 +455,14 @@ check_startup_scripts() {
     header "Startup Scripts"
     desc "Legacy SysV init scripts — another persistence location."
     run_paged "ls -la /etc/init.d/"
-    run "ls -la /etc/rc2.d/"
+    run "ls -la /etc/rc.d/rc3.d/ 2>/dev/null || ls -la /etc/rc3.d/ 2>/dev/null"
 
     analysis_header
-    local known=("acpid" "apparmor" "apport" "chrony" "console-setup.sh" "cron"
-        "cryptdisks" "cryptdisks-early" "dbus" "grub-common" "hibagent"
-        "irqbalance" "iscsid" "keyboard-setup.sh" "kmod" "nginx" "open-iscsi"
-        "open-vm-tools" "plymouth" "plymouth-log" "procps" "rsync"
-        "screen-cleanup" "ssh" "sysstat" "ufw" "unattended-upgrades" "uuidd")
+    local known=("acpid" "auditd" "crond" "dbus" "firewalld" "irqbalance"
+        "kdump" "microcode_ctl" "network" "NetworkManager" "nginx" "httpd"
+        "plymouth" "postfix" "rsyslog" "sshd" "tuned" "chronyd"
+        "functions" "halt" "killall" "netconsole" "netfs" "rdisc"
+        "README" "sandbox" "single")
 
     local unknown_scripts=()
     while IFS= read -r script; do
@@ -466,7 +473,7 @@ check_startup_scripts() {
     done <<< "$(ls /etc/init.d/ 2>/dev/null)"
 
     if [ "${#unknown_scripts[@]}" -eq 0 ]; then
-        ok "All init.d scripts match known Ubuntu defaults."
+        ok "All init.d scripts match known Fedora defaults."
     else
         warn "${#unknown_scripts[@]} unfamiliar init.d script(s):"
         for s in "${unknown_scripts[@]}"; do
@@ -496,10 +503,10 @@ check_shell_users() {
             ok "  ${BOLD}$user${RESET} (UID $uid, shell: $shell)"
             local pw_status; pw_status=$(sudo passwd -S "$user" 2>/dev/null | awk '{print $2}')
             case "$pw_status" in
-                P)  warn "  ↳ $user has a password set — SSH key-only login is more secure." ;;
+                PS) warn "  ↳ $user has a password set — SSH key-only login is more secure." ;;
                 NP) flag "  ↳ $user has NO PASSWORD — account accessible without credentials!"
                     fix "  sudo passwd $user" ;;
-                L)  ok "  ↳ $user's password is locked (key-only — good)." ;;
+                LK) ok "  ↳ $user's password is locked (key-only — good)." ;;
             esac
         done <<< "$human_users"
     fi
@@ -601,46 +608,32 @@ check_suid() {
 
     analysis_header
 
-    # Cross-reference against dpkg — unpackaged SUID binaries are suspicious.
-    # Snap binaries (/snap/*) are managed outside dpkg entirely — skip them.
+    # Cross-reference against rpm — unpackaged SUID binaries are suspicious.
     #
-    # dpkg -S path lookup has two subtleties on Ubuntu 22.04+:
-    #   1. The binary may be a symlink — resolve it with readlink first.
-    #   2. dpkg recorded paths under /bin but the canonical path is /usr/bin
-    #      (because /bin -> /usr/bin). Try the /usr-stripped path as a fallback.
-    #
-    # We use a helper that tries each candidate and returns on the first hit,
-    # because chaining with || loses the exit code once cut(1) is in the pipe.
-    _dpkg_owner() {
+    # rpm -qf resolves which package owns a file. If no package owns it,
+    # the binary was manually placed and warrants investigation.
+    _rpm_owner() {
         local p
         for p in "$@"; do
-            local result; result=$(dpkg -S "$p" 2>/dev/null | cut -d: -f1)
+            local result; result=$(rpm -qf "$p" 2>/dev/null | grep -v 'not owned')
             [ -n "$result" ] && echo "$result" && return 0
         done
         return 1
     }
 
     spinner_start "Verifying SUID binaries against installed packages..."
-    local unpackaged=() pkg_count=0 snap_count=0
+    local unpackaged=() pkg_count=0
     while IFS= read -r path; do
         [ -z "$path" ] && continue
 
-        # Skip snap — managed by snapd, invisible to dpkg
-        if [[ "$path" == /snap/* ]]; then
-            (( snap_count++ ))
-            continue
-        fi
-
         local real_path; real_path=$(readlink -f "$path" 2>/dev/null || echo "$path")
-        local alt_path; alt_path=$(echo "$path" | sed 's|^/usr/|/|')
 
-        local pkg; pkg=$(_dpkg_owner "$path" "$real_path" "$alt_path" || true)
+        local pkg; pkg=$(_rpm_owner "$path" "$real_path" || true)
         [ -z "$pkg" ] && unpackaged+=("$path") || pkg_count=$(( pkg_count + 1 ))
     done <<< "$output"
 
     spinner_stop
     ok "$pkg_count SUID binaries owned by installed packages — expected."
-    [ "$snap_count" -gt 0 ] && ok "$snap_count SUID binaries inside /snap — managed by snapd, not dpkg. Skipped."
     if [ "${#unpackaged[@]}" -gt 0 ]; then
         flag "${#unpackaged[@]} SUID binary/binaries NOT owned by any package:"
         for f in "${unpackaged[@]}"; do
@@ -649,7 +642,7 @@ check_suid() {
             fix "  Remove SUID if not needed: sudo chmod u-s $f"
         done
     else
-        ok "All non-snap SUID binaries are owned by installed packages."
+        ok "All SUID binaries are owned by installed packages."
     fi
 
     # Shells or interpreters with SUID — instant root escalation
@@ -690,10 +683,11 @@ check_etc_modified() {
         "/etc/ssh/ssh_host_rsa_key" "/etc/ssh/ssh_host_rsa_key.pub"
         "/etc/ssh/ssh_host_ecdsa_key" "/etc/ssh/ssh_host_ecdsa_key.pub"
         "/etc/ssh/ssh_host_ed25519_key" "/etc/ssh/ssh_host_ed25519_key.pub"
-        "/etc/netplan/50-cloud-init.yaml" "/etc/apt/sources.list.d/ubuntu.sources"
-        "/etc/udev/rules.d/90-cloud-init-hook-hotplug.rules" "/etc/ld.so.cache"
+        "/etc/NetworkManager/system-connections/*.nmconnection"
+        "/etc/sysconfig/network-scripts/ifcfg-*"
+        "/etc/yum.repos.d/*.repo" "/etc/ld.so.cache"
     )
-    local cloud_init_patterns=("/etc/pam.d/common-" "/etc/ssh/ssh_host_")
+    local cloud_init_patterns=("/etc/pam.d/" "/etc/ssh/ssh_host_")
 
     _is_provisioning_write() {
         local f="$1"
@@ -719,11 +713,11 @@ check_etc_modified() {
 
     local tier1=("/etc/passwd" "/etc/shadow" "/etc/sudoers" "/etc/ssh/sshd_config"
         "/etc/ld.so.preload" "/etc/pam.d/sshd" "/etc/pam.d/sudo"
-        "/etc/pam.d/common-auth" "/etc/profile" "/etc/bash.bashrc"
+        "/etc/pam.d/system-auth" "/etc/profile" "/etc/bashrc"
         "/etc/environment" "/etc/crontab")
     local tier2=("/etc/hosts" "/etc/resolv.conf" "/etc/nsswitch.conf"
         "/etc/ssh/ssh_config" "/etc/sysctl.conf" "/etc/security/limits.conf"
-        "/etc/apt/sources.list")
+        "/etc/yum.repos.d" "/etc/dnf/dnf.conf")
 
     local t1_hit=0 t2_hit=0
     for f in "${tier1[@]}"; do
@@ -735,7 +729,7 @@ check_etc_modified() {
         else
             local mtime_human; mtime_human=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1 || echo "unknown")
             flag "Critical config modified post-provisioning: ${BOLD}$f${RESET} (at $mtime_human)"
-            fix "Verify: debsums -c && sudo ausearch -f $f 2>/dev/null | tail -20"
+            fix "Verify: sudo rpm -Va && sudo ausearch -f $f 2>/dev/null | tail -20"
         fi
         t1_hit=1
     done
@@ -751,9 +745,12 @@ check_etc_modified() {
     [ "$t1_hit" -eq 0 ] && [ "$t2_hit" -eq 0 ] \
         && ok "No critical config files were modified after provisioning."
 
-    local last_apt; last_apt=$(grep -E 'install|upgrade' /var/log/dpkg.log 2>/dev/null | tail -3 || true)
-    [ -n "$last_apt" ] && info "Recent apt activity (may explain some modifications):" \
-        && while IFS= read -r l; do info "  $l"; done <<< "$last_apt"
+    local last_dnf; last_dnf=$(sudo dnf history list --recent 2>/dev/null | head -5 || true)
+    if [ -z "$last_dnf" ]; then
+        last_dnf=$(grep -E 'install|upgrade|erase' /var/log/dnf.log 2>/dev/null | tail -3 || true)
+    fi
+    [ -n "$last_dnf" ] && info "Recent dnf activity (may explain some modifications):" \
+        && while IFS= read -r l; do info "  $l"; done <<< "$last_dnf"
 
     pause
 }
@@ -776,13 +773,13 @@ check_bin_modified() {
 
     info "$count binary/binaries modified in the last 30 days."
 
-    local apt_dates; apt_dates=$(grep -E 'upgrade|install' /var/log/dpkg.log 2>/dev/null | awk '{print $1}' | sort -u | tail -10)
-    if [ -n "$apt_dates" ]; then
+    local dnf_dates; dnf_dates=$(grep -E 'upgrade|install' /var/log/dnf.log 2>/dev/null | awk '{print $1}' | sort -u | tail -10 || true)
+    if [ -n "$dnf_dates" ]; then
         ok "Recent package activity found — changes are likely legitimate upgrades."
-        info "Dates of recent apt operations: $(echo "$apt_dates" | tr '\n' ' ')"
+        info "Dates of recent dnf operations: $(echo "$dnf_dates" | tr '\n' ' ')"
     else
-        warn "No recent apt/dpkg activity found but binaries were modified."
-        fix "Verify each binary: dpkg -S <path> then: debsums <package-name>"
+        warn "No recent dnf activity found but binaries were modified."
+        fix "Verify each binary: rpm -qf <path> then: rpm -V <package-name>"
     fi
 
     local tier1_bins=("ps" "ls" "top" "netstat" "ss" "find" "who" "w" "last"
@@ -793,26 +790,24 @@ check_bin_modified() {
         for r in "${tier1_bins[@]}"; do
             if [ "$base" = "$r" ]; then
                 flag "High-value binary modified: ${BOLD}$f${RESET} — rootkits routinely replace this."
-                fix "Verify: dpkg -S $f && debsums $(dpkg -S $f 2>/dev/null | cut -d: -f1)"
+                fix "Verify: rpm -qf $f && rpm -V $(rpm -qf $f 2>/dev/null)"
                 tier1_hit=1; break
             fi
         done
     done <<< "$output"
     [ "$tier1_hit" -eq 0 ] && ok "None of the highest-risk binaries (ps, ls, ss, sshd etc.) were modified."
 
-    if command -v debsums &>/dev/null; then
-        spinner_start "Running debsums integrity check (this may take a while)..."
-        local debsums_fail; debsums_fail=$(sudo debsums -c 2>/dev/null | grep -v 'OK$' || true)
-        spinner_stop
-        if [ -n "$debsums_fail" ]; then
-            flag "debsums found hash mismatches:"
-            while IFS= read -r l; do flag "  $l"; done <<< "$debsums_fail"
-            fix "Reinstall affected packages: sudo apt install --reinstall <package>"
-        else
-            ok "debsums: all checked binaries match their package hashes."
-        fi
+    # rpm -Va verifies all installed packages against their checksums
+    spinner_start "Running rpm package integrity check (this may take a while)..."
+    local rpm_verify; rpm_verify=$(sudo rpm -Va 2>/dev/null | grep -E '^..5' || true)
+    spinner_stop
+    if [ -n "$rpm_verify" ]; then
+        flag "rpm -Va found files with hash mismatches (checksum changed):"
+        while IFS= read -r l; do flag "  $l"; done <<< "$(echo "$rpm_verify" | head -20)"
+        [ "$(echo "$rpm_verify" | wc -l)" -gt 20 ] && info "  ... and more (showing first 20)"
+        fix "Reinstall affected packages: sudo dnf reinstall <package>"
     else
-        fix "Install debsums for hash verification: sudo apt install debsums && sudo debsums -c"
+        ok "rpm -Va: all checked binaries match their package hashes."
     fi
 
     pause

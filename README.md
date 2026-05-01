@@ -1,6 +1,6 @@
-# Ubuntu Server Security Audit
+# Fedora Server Security Audit
 
-An interactive terminal tool for auditing the security of an Ubuntu server. It runs diagnostic commands, analyses the output for red flags, and tells you exactly what to fix and how.
+An interactive terminal tool for auditing the security of a Fedora server. It runs diagnostic commands, analyses the output for red flags, and tells you exactly what to fix and how.
 
 ---
 
@@ -10,20 +10,20 @@ Clone the repository directly onto your server:
 
 ```bash
 git clone https://github.com/Amplify-Maverick/ubuntu-security-audit.git
-cd ubuntu-security-audit
+cd ubuntu-security-audit/fedora-security-audit
 chmod +x server_audit.sh
 ```
 
 If `git` isn't installed:
 
 ```bash
-sudo apt install git -y
+sudo dnf install git -y
 ```
 
 To update to the latest version later:
 
 ```bash
-cd ubuntu-security-audit
+cd fedora-security-audit
 git pull
 ```
 
@@ -95,14 +95,14 @@ Each check prints the raw command output followed by an **Analysis** section tha
 | 14 | Shell users | Human accounts with no password, system accounts with interactive shells |
 | 15 | UID 0 accounts | Any account other than `root` with UID 0 (classic attacker backdoor) |
 | 16 | Sudoers | NOPASSWD ALL entries, unexpected sudoers.d files granting escalated privileges |
-| 17 | SUID binaries | Unpackaged SUID binaries (verified via `dpkg`), shells or interpreters with SUID set |
+| 17 | SUID binaries | Unpackaged SUID binaries (verified via `rpm`), shells or interpreters with SUID set |
 
 ### File System (options 18–20)
 
 | # | Check | What it looks for |
 |---|-------|-------------------|
 | 18 | Modified /etc files | Critical configs changed after provisioning — suppresses expected cloud-init writes to avoid false positives |
-| 19 | Modified system binaries | Changes to `/bin`, `/usr/bin`, etc. — cross-references `dpkg` log and runs `debsums` hash verification if available |
+| 19 | Modified system binaries | Changes to `/bin`, `/usr/bin`, etc. — cross-references `dnf` log and runs `rpm -Va` hash verification |
 | 20 | Hidden files in /tmp | Hidden dot-files, executable binaries, and large files (>1MB) in world-writable directories |
 
 ### Malware Scanning (options 21–24)
@@ -136,6 +136,21 @@ audit/
 
 ---
 
+## Key differences from the Ubuntu version
+
+| Area | Ubuntu | Fedora |
+|------|--------|--------|
+| Package manager | `apt` / `dpkg` | `dnf` / `rpm` |
+| Firewall | UFW (`ufw`) | firewalld (`firewall-cmd`) |
+| Auth logs | `/var/log/auth.log` | `/var/log/secure` (fallback: `journalctl -u sshd`) |
+| SSH service name | `ssh` | `sshd` |
+| Package verification | `debsums` | `rpm -Va` |
+| Package ownership | `dpkg -S` | `rpm -qf` |
+| Cron daemon | `cron` | `crond` |
+| Known services | Ubuntu/AWS service list | Fedora/RHEL service list (SELinux, tuned, auditd, etc.) |
+
+---
+
 ## Disclaimer
 
 This script is a diagnostic aid, not a guarantee of security. Always independently verify command outputs and findings using your own judgment and additional tools. No automated script can account for every environment, configuration, or threat — use this as a starting point for investigation, not a final verdict on whether your server is safe.
@@ -145,6 +160,6 @@ This script is a diagnostic aid, not a guarantee of security. Always independent
 ## Notes
 
 - The script does not make any changes to your system on its own. Every remediation step requires you to run the suggested command manually.
-- Malware scanner options (21–23) will run `apt install` if the tool is not already present.
+- Malware scanner options (21–23) will run `dnf install` if the tool is not already present.
 - The modified `/etc` files check (option 18) automatically suppresses files written by cloud-init during provisioning so you don't get false positives on a freshly launched instance.
-- Tested on Ubuntu 22.04 and 24.04 on AWS EC2. Most checks will work on any Debian-based system.
+- Designed and tested for Fedora Server. Most checks will work on any RHEL-based system (RHEL, CentOS Stream, Rocky Linux, AlmaLinux).

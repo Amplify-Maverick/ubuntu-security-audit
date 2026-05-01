@@ -32,7 +32,7 @@ SUBMENU_NETWORK=(
     "All running processes"
     "Listening ports"
     "Established outbound connections"
-    "Firewall (UFW)"
+    "Firewall (firewalld)"
     "Run all Processes & Network checks"
     "← Back"
 )
@@ -130,7 +130,7 @@ draw_menu() {
     # ── Banner ──
     _line "${BOLD}"
     _line "  ╔══════════════════════════════════════════╗"
-    _line "  ║       Ubuntu Server Security Audit       ║"
+    _line "  ║       Fedora Server Security Audit       ║"
     _line "  ╚══════════════════════════════════════════╝"
     _line "${RESET}"
 
@@ -248,7 +248,7 @@ submenu_dispatch() {
         "All running processes")                        check_processes ;;
         "Listening ports")                              check_ports ;;
         "Established outbound connections")             check_outbound ;;
-        "Firewall (UFW)")                                check_firewall ;;
+        "Firewall (firewalld)")                         check_firewall ;;
         "Run all Processes & Network checks")
             check_processes; check_ports; check_outbound; check_firewall ;;
         # Persistence & Startup

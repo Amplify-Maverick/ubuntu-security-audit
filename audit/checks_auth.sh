@@ -19,7 +19,7 @@ check_active_sessions() {
     root_sessions=$(echo "$sessions" | awk '$1=="root"' || true)
     if [ -n "$root_sessions" ]; then
         flag "Root is directly logged in — root should not have interactive SSH sessions."
-        fix "Disable root SSH: set 'PermitRootLogin no' in /etc/ssh/sshd_config, then: sudo systemctl restart ssh"
+        fix "Disable root SSH: set 'PermitRootLogin no' in /etc/ssh/sshd_config, then: sudo systemctl restart sshd"
     else
         ok "No direct root sessions."
     fi
@@ -92,14 +92,14 @@ check_login_history() {
         while IFS= read -r ip; do info "  ${BOLD}$ip${RESET}"; done <<< "$unique_ips"
     else
         flag "$ip_count distinct source IPs in recent login history — unusually high."
-        fix "Review each IP. Block unknowns with: sudo ufw deny from <ip>"
+        fix "Review each IP. Block unknowns with: sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=<ip> drop' && sudo firewall-cmd --reload"
         while IFS= read -r ip; do info "  ${BOLD}$ip${RESET}"; done <<< "$unique_ips"
     fi
 
     if [ -n "$odd_hour_logins" ]; then
         warn "Login(s) detected between midnight and 5am — verify these were you:"
         while IFS= read -r l; do warn "  $l"; done <<< "$odd_hour_logins"
-        fix "If unexpected: grep 'Accepted' /var/log/auth.log"
+        fix "If unexpected: sudo journalctl -u sshd | grep 'Accepted'"
     else
         ok "No logins during unusual hours (midnight–5am)."
     fi
@@ -115,24 +115,55 @@ check_login_history() {
 
 check_failed_logins() {
     header "Failed Login Attempts"
-    desc "Scans auth.log for failed SSH password attempts."
+    desc "Scans secure log for failed SSH password attempts."
+
+    # Fedora uses /var/log/secure or journalctl for auth logs
     local output
-    output=$(grep 'Failed password' /var/log/auth.log 2>/dev/null | tail -30)
-    [ -n "$output" ] && pager "$output" || echo "(no failed password attempts in auth.log)"
+    if [ -f /var/log/secure ]; then
+        output=$(grep 'Failed password' /var/log/secure 2>/dev/null | tail -30)
+    else
+        output=$(sudo journalctl -u sshd --no-pager 2>/dev/null | grep 'Failed password' | tail -30)
+    fi
+    [ -n "$output" ] && pager "$output" || echo "(no failed password attempts found)"
     echo
 
     analysis_header
-    local total; total=$(grep -c 'Failed password' /var/log/auth.log 2>/dev/null || echo 0)
+
+    local total
+    if [ -f /var/log/secure ]; then
+        total=$(grep -c 'Failed password' /var/log/secure 2>/dev/null || echo 0)
+    else
+        total=$(sudo journalctl -u sshd --no-pager 2>/dev/null | grep -c 'Failed password' || echo 0)
+    fi
+
+    local auth_source
+    if [ -f /var/log/secure ]; then
+        auth_source="/var/log/secure"
+    else
+        auth_source="journalctl -u sshd"
+    fi
 
     local top_ips
-    top_ips=$(grep 'Failed password' /var/log/auth.log 2>/dev/null \
-        | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-        | awk '{print $2}' | sort | uniq -c | sort -rn | head -5)
+    if [ -f /var/log/secure ]; then
+        top_ips=$(grep 'Failed password' /var/log/secure 2>/dev/null \
+            | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+            | awk '{print $2}' | sort | uniq -c | sort -rn | head -5)
+    else
+        top_ips=$(sudo journalctl -u sshd --no-pager 2>/dev/null | grep 'Failed password' \
+            | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+            | awk '{print $2}' | sort | uniq -c | sort -rn | head -5)
+    fi
 
     local top_users
-    top_users=$(grep 'Failed password' /var/log/auth.log 2>/dev/null \
-        | grep -oP '(?<=for (invalid user )?)\S+(?= from)' \
-        | sort | uniq -c | sort -rn | head -5)
+    if [ -f /var/log/secure ]; then
+        top_users=$(grep 'Failed password' /var/log/secure 2>/dev/null \
+            | grep -oP '(?<=for (invalid user )?)\S+(?= from)' \
+            | sort | uniq -c | sort -rn | head -5)
+    else
+        top_users=$(sudo journalctl -u sshd --no-pager 2>/dev/null | grep 'Failed password' \
+            | grep -oP '(?<=for (invalid user )?)\S+(?= from)' \
+            | sort | uniq -c | sort -rn | head -5)
+    fi
 
     if [ "$total" -eq 0 ]; then
         ok "No failed login attempts on record."
@@ -140,10 +171,10 @@ check_failed_logins() {
         ok "$total failed attempt(s) — low noise, likely background internet scanning."
     elif [ "$total" -lt 500 ]; then
         warn "$total failed attempts — your server is being probed."
-        fix "Install fail2ban: sudo apt install fail2ban -y"
+        fix "Install fail2ban: sudo dnf install fail2ban -y"
     else
         flag "$total failed attempts — sustained brute-force attack in progress."
-        fix "sudo apt install fail2ban -y && sudo systemctl enable --now fail2ban"
+        fix "sudo dnf install fail2ban -y && sudo systemctl enable --now fail2ban"
         fix "Also set 'PasswordAuthentication no' in /etc/ssh/sshd_config"
     fi
 
@@ -154,7 +185,7 @@ check_failed_logins() {
             count=$(echo "$line" | awk '{print $1}'); ip=$(echo "$line" | awk '{print $2}')
             if [ "$count" -gt 100 ]; then
                 flag "  ${BOLD}$count${RESET} attempts from ${BOLD}$ip${RESET}"
-                fix "  Block now: sudo ufw deny from $ip to any && sudo ufw reload"
+                fix "  Block now: sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=$ip drop' && sudo firewall-cmd --reload"
             elif [ "$count" -gt 20 ]; then
                 warn "  ${BOLD}$count${RESET} attempts from ${BOLD}$ip${RESET}"
             else
@@ -164,7 +195,12 @@ check_failed_logins() {
     fi
 
     if [ -n "$top_users" ]; then
-        local invalid_count; invalid_count=$(grep -c 'invalid user' /var/log/auth.log 2>/dev/null || echo 0)
+        local invalid_count
+        if [ -f /var/log/secure ]; then
+            invalid_count=$(grep -c 'invalid user' /var/log/secure 2>/dev/null || echo 0)
+        else
+            invalid_count=$(sudo journalctl -u sshd --no-pager 2>/dev/null | grep -c 'invalid user' || echo 0)
+        fi
         [ "$invalid_count" -gt 10 ] && warn "$invalid_count attempts for non-existent usernames — credential stuffing."
         info "Most targeted usernames:"
         while IFS= read -r line; do
@@ -178,7 +214,7 @@ check_failed_logins() {
         [ -n "$banned" ] && info "Currently banned IPs: $banned"
     else
         warn "fail2ban is not running — failed logins are not being auto-blocked."
-        fix "sudo apt install fail2ban -y && sudo systemctl enable --now fail2ban"
+        fix "sudo dnf install fail2ban -y && sudo systemctl enable --now fail2ban"
     fi
 
     pause
@@ -187,34 +223,54 @@ check_failed_logins() {
 check_accepted_logins() {
     header "Successful Logins"
     desc "Shows SSH logins that were accepted. Any login you did not initiate is an intruder."
+
     local output
-    output=$(grep 'Accepted' /var/log/auth.log 2>/dev/null | tail -20)
-    [ -n "$output" ] && pager "$output" || echo "(no accepted logins in auth.log)"
+    if [ -f /var/log/secure ]; then
+        output=$(grep 'Accepted' /var/log/secure 2>/dev/null | tail -20)
+    else
+        output=$(sudo journalctl -u sshd --no-pager 2>/dev/null | grep 'Accepted' | tail -20)
+    fi
+    [ -n "$output" ] && pager "$output" || echo "(no accepted logins found)"
     echo
 
     analysis_header
-    local total; total=$(grep -c 'Accepted' /var/log/auth.log 2>/dev/null || echo 0)
-    local pw_logins; pw_logins=$(grep -c 'Accepted password' /var/log/auth.log 2>/dev/null || echo 0)
-    local key_logins; key_logins=$(grep -c 'Accepted publickey' /var/log/auth.log 2>/dev/null || echo 0)
-    local root_logins; root_logins=$(grep 'Accepted' /var/log/auth.log 2>/dev/null | grep 'for root' || true)
+
+    local total pw_logins key_logins root_logins
+    if [ -f /var/log/secure ]; then
+        total=$(grep -c 'Accepted' /var/log/secure 2>/dev/null || echo 0)
+        pw_logins=$(grep -c 'Accepted password' /var/log/secure 2>/dev/null || echo 0)
+        key_logins=$(grep -c 'Accepted publickey' /var/log/secure 2>/dev/null || echo 0)
+        root_logins=$(grep 'Accepted' /var/log/secure 2>/dev/null | grep 'for root' || true)
+    else
+        local journal_out; journal_out=$(sudo journalctl -u sshd --no-pager 2>/dev/null)
+        total=$(echo "$journal_out" | grep -c 'Accepted' || echo 0)
+        pw_logins=$(echo "$journal_out" | grep -c 'Accepted password' || echo 0)
+        key_logins=$(echo "$journal_out" | grep -c 'Accepted publickey' || echo 0)
+        root_logins=$(echo "$journal_out" | grep 'Accepted' | grep 'for root' || true)
+    fi
 
     [ "$key_logins" -gt 0 ] && ok "$key_logins login(s) via SSH public key (most secure)."
     if [ "$pw_logins" -gt 0 ]; then
         flag "$pw_logins login(s) via password — vulnerable to brute-force."
-        fix "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config, then restart ssh"
+        fix "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config, then restart sshd"
     fi
 
     if [ -n "$root_logins" ]; then
         flag "Direct root login(s) detected."
-        fix "Set 'PermitRootLogin no' in /etc/ssh/sshd_config, then: sudo systemctl restart ssh"
+        fix "Set 'PermitRootLogin no' in /etc/ssh/sshd_config, then: sudo systemctl restart sshd"
         while IFS= read -r l; do flag "  $l"; done <<< "$root_logins"
     else
         ok "No direct root logins on record."
     fi
 
     local all_ips
-    all_ips=$(grep 'Accepted' /var/log/auth.log 2>/dev/null \
-        | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | sort -u)
+    if [ -f /var/log/secure ]; then
+        all_ips=$(grep 'Accepted' /var/log/secure 2>/dev/null \
+            | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | sort -u)
+    else
+        all_ips=$(sudo journalctl -u sshd --no-pager 2>/dev/null | grep 'Accepted' \
+            | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | sort -u)
+    fi
     local ip_count; ip_count=$(echo "$all_ips" | grep -c '.' 2>/dev/null || echo 0)
 
     if [ "$ip_count" -eq 0 ]; then
@@ -225,9 +281,9 @@ check_accepted_logins() {
         warn "$ip_count distinct IPs have successfully logged in — verify each one:"
         while IFS= read -r ip; do
             warn "  ${BOLD}$ip${RESET}"
-            fix "  Restrict SSH: sudo ufw allow from $ip to any port 22"
+            fix "  Restrict SSH: sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=$ip service name=ssh accept'"
         done <<< "$all_ips"
-        fix "After allowlisting your IP, block all others: sudo ufw deny 22"
+        fix "After allowlisting your IP, remove the general SSH rule: sudo firewall-cmd --permanent --remove-service=ssh && sudo firewall-cmd --reload"
     fi
 
     pause

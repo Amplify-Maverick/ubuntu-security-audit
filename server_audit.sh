@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# server_audit.sh — Ubuntu Server Security Audit
+# server_audit.sh — Fedora Server Security Audit
 # Usage: chmod +x server_audit.sh && sudo ./server_audit.sh
 # ─────────────────────────────────────────────────────────────────────────────
 
